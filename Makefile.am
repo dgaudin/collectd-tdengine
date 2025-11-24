@@ -2401,6 +2401,14 @@ write_syslog_la_SOURCES = src/write_syslog.c
 write_syslog_la_LDFLAGS = $(PLUGIN_LDFLAGS)
 endif
 
+if BUILD_PLUGIN_WRITE_TDENGINE
+pkglib_LTLIBRARIES += write_tdengine.la
+write_tdengine_la_SOURCES = src/write_tdengine.c
+write_tdengine_la_LDFLAGS = $(PLUGIN_LDFLAGS)
+write_tdengine_la_CFLAGS = $(AM_CFLAGS) -I$(top_srcdir)/include-tdengine
+write_tdengine_la_LIBADD = -lpthread -ltaos
+endif
+
 if BUILD_PLUGIN_WRITE_TSDB
 pkglib_LTLIBRARIES += write_tsdb.la
 write_tsdb_la_SOURCES = src/write_tsdb.c
