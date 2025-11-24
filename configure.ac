@@ -145,10 +145,6 @@ if test "x$ac_system" = "xAIX"; then
   AC_DEFINE([_THREAD_SAFE_ERRNO], [1], [Define to use the thread-safe version of errno under AIX.])
 fi
 
-if test "x${prefix}" != xNONE; then
-  AC_DEFINE_UNQUOTED([PREFIX], ["${prefix}"], [Define the install prefix.])
-fi
-
 # Where to install .pc files.
 pkgconfigdir="${libdir}/pkgconfig"
 AC_SUBST([pkgconfigdir])
@@ -974,12 +970,6 @@ if test "x$have_strptime" = "xyes" && test "x$c_cv_have_strptime_default" = "xno
               #ifndef _XOPEN_SOURCE
               # define _XOPEN_SOURCE 500
               #endif
-              # ifndef _BSD_SOURCE
-              #  define _BSD_SOURCE
-              # endif
-              # ifndef _DEFAULT_SOURCE
-              #  define _DEFAULT_SOURCE
-              # endif
               #include <time.h>
             ]],
             [[
@@ -1030,12 +1020,6 @@ AC_CACHE_CHECK([for timegm],
 # ifndef _XOPEN_SOURCE
 #  define _XOPEN_SOURCE 500
 # endif
-# ifndef _BSD_SOURCE
-#  define _BSD_SOURCE
-# endif
-# ifndef _DEFAULT_SOURCE
-#  define _DEFAULT_SOURCE
-# endif
 #endif
 #include <time.h>
 ]]],
@@ -1051,9 +1035,50 @@ AC_CACHE_CHECK([for timegm],
   )
 )
 
+if test "x$c_cv_have_timegm" != "xyes"
+then
+  AC_CACHE_CHECK([for timegm with _BSD_SOURCE],
+    [c_cv_have_timegm_bsd],
+    AC_LINK_IFELSE(
+      [AC_LANG_PROGRAM(
+[[[
+#if STRPTIME_NEEDS_STANDARDS
+# ifndef _ISOC99_SOURCE
+#  define _ISOC99_SOURCE 1
+# endif
+# ifndef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200112L
+# endif
+# ifndef _XOPEN_SOURCE
+#  define _XOPEN_SOURCE 500
+# endif
+#endif
+#ifndef _BSD_SOURCE
+# define _BSD_SOURCE 1
+#endif
+#include <time.h>
+]]],
+[[[
+ time_t t = timegm(&(struct tm){0});
+ if (t == ((time_t) -1)) {
+   return 1;
+ }
+]]]
+      )],
+      [c_cv_have_timegm_bsd="yes"
+       c_cv_have_timegm="yes"],
+      [c_cv_have_timegm_bsd="no"]
+    )
+  )
+fi
+
 if test "x$c_cv_have_timegm" = "xyes"
 then
   AC_DEFINE(HAVE_TIMEGM, 1, [Define if the timegm(3) function is available.])
+  if test "x$c_cv_have_timegm_bsd" = "xyes"
+  then
+    AC_DEFINE(TIMEGM_NEEDS_BSD, 1, [Set to true if timegm is only exported in BSD mode.])
+  fi
 fi
 
 CFLAGS="$SAVE_CFLAGS"
@@ -2040,27 +2065,13 @@ if test "x$with_kvm_openfiles" = "xyes"; then
   with_libkvm="yes"
 fi
 
-AC_CHECK_HEADERS([libpfctl.h],,,
-[
-  #include <sys/queue.h>
-  #include <sys/types.h>
-  #include <netinet/in.h>
-  #include <net/if.h>
-  #include <net/pfvar.h>
-])
-AC_CHECK_LIB([pfctl], [pfctl_status_counter],
-  [with_libpfctl="yes"],
-  [with_libpfctl="no"]
-)
-AM_CONDITIONAL([BUILD_WITH_LIBPFCTL], [test "x$with_libpfctl" = "xyes"])
-
 # --with-cuda {{{
 AC_ARG_WITH([cuda],
   [AS_HELP_STRING([--with-cuda@<:@=PREFIX@:>@], [Path to cuda.])],
   [
     if test "x$withval" != "xno" && test "x$withval" != "xyes"; then
       with_cuda_cppflags="-I$withval/include"
-      with_cuda_ldflags="-L$withval/lib"
+      with_cuda_ldflags="-I$withval/lib"
       with_cuda="yes"
     else
       with_cuda="$withval"
@@ -2090,35 +2101,6 @@ fi
 AC_SUBST([BUILD_WITH_CUDA_CPPFLAGS])
 AC_SUBST([BUILD_WITH_CUDA_LDFLAGS])
 AC_SUBST([BUILD_WITH_CUDA_LIBS])
-
-# }}}
-
-# --with-epics-base {{{
-AC_ARG_WITH([epics-base],
-  [AS_HELP_STRING([--with-epics-base@<:@=PREFIX@:>@], [Path to epics-base.])],
-  [
-    with_epics_base="$withval"
-    if test "x$withval" = "xno"; then
-      with_epics_base="no (disabled on command line)"
-    fi
-  ],
-  [with_epics_base="yes"]
-)
-
-if test "x$with_epics_base" = "xyes"; then
-PKG_CHECK_MODULES([EPICS_BASE], [epics-base],
-  [with_epics_base="yes"],
-  [with_epics_base="no (pkg-config could not find epics-base)"]
-)
-fi
-
-if test "x$with_epics_base" = "xyes"; then
-  BUILD_WITH_EPICS_BASE_CFLAGS="$EPICS_BASE_CFLAGS"
-  BUILD_WITH_EPICS_BASE_LIBS="$EPICS_BASE_LIBS -lca"
-fi
-
-AC_SUBST([BUILD_WITH_EPICS_BASE_CFLAGS])
-AC_SUBST([BUILD_WITH_EPICS_BASE_LIBS])
 
 # }}}
 
@@ -2241,7 +2223,7 @@ LDFLAGS="$LDFLAGS $LIBREDFISH_LDFLAGS"
 
 if test "x$with_libredfish" = "xyes"; then
   if test "x$LIBREDFISH_CPPFLAGS" != "x"; then
-    AC_MSG_NOTICE([libredfish CPPFLAGS: $LIBREDFISH_CPPFLAGS])
+    AC_MSG_NOTICE([libredfish CPPFLAGS: $LIBHIREDFISH_CPPFLAGS])
   fi
   AC_CHECK_HEADERS([redfish.h],
     [with_libredfish="yes"],
@@ -2270,52 +2252,6 @@ fi
 AC_SUBST([BUILD_WITH_LIBREDFISH_CPPFLAGS])
 AC_SUBST([BUILD_WITH_LIBREDFISH_LDFLAGS])
 
-# }}}
-
-# --with-sqlite3 {{{
-AC_ARG_WITH([sqlite3],
-  [AS_HELP_STRING([--with-sqlite3@<:@=PREFIX@:>@], [Path to sqlite3.])],
-  [
-    if test "x$withval" = "xyes"; then
-      with_sqlite3="yes"
-    else if test "x$withval" = "xno"; then
-      with_sqlite3="no"
-    else
-      with_sqlite3="yes"
-      SQLITE3_CPPFLAGS="$SQLITE3_CPPFLAGS -I$withval/include"
-      SQLITE3_LDFLAGS="$SQLITE3_LDFLAGS -L$withval/lib"
-    fi; fi
-  ],
-  [with_sqlite3="yes"]
-)
-
-SAVE_CPPFLAGS="$CPPFLAGS"
-SAVE_LDFLAGS="$LDFLAGS"
-CPPFLAGS="$CPPFLAGS $SQLITE3_CPPFLAGS"
-LDFLAGS="$LDFLAGS $SQLITE3_LDFLAGS"
-
-if test "x$with_sqlite3" = "xyes"; then
-  if test "x$SQLITE3_CPPFLAGS" != "x"; then
-    AC_MSG_NOTICE([sqlite3 CPPFLAGS: $SQLITE3_CPPFLAGS])
-  fi
-  AC_CHECK_HEADERS([sqlite3.h],
-    [with_sqlite3="yes"],
-    [with_sqlite3="no (sqlite3.h not found)"]
-  )
-fi
-
-CPPFLAGS="$SAVE_CPPFLAGS"
-LDFLAGS="$SAVE_LDFLAGS"
-
-if test "x$with_sqlite3" = "xyes"; then
-  BUILD_WITH_SQLITE3_CPPFLAGS="$SQLITE3_CPPFLAGS"
-  BUILD_WITH_SQLITE3_LDFLAGS="$SQLITE3_LDFLAGS"
-  BUILD_WITH_SQLITE3_LIBS="-lsqlite3"
-fi
-
-AC_SUBST([BUILD_WITH_SQLITE3_CPPFLAGS])
-AC_SUBST([BUILD_WITH_SQLITE3_LDFLAGS])
-AC_SUBST([BUILD_WITH_SQLITE3_LIBS])
 # }}}
 
 # --with-libcurl {{{
@@ -2386,12 +2322,6 @@ if test "x$with_libcurl" = "xyes"; then
       [have_curlopt_timeout="no"],
       [[#include <curl/curl.h>]]
     )
-
-    AC_CHECK_DECL(CURLOPT_UNIX_SOCKET_PATH,
-      [have_curlopt_unix_socket_path="yes"],
-      [have_curlopt_unix_socket_path="no"],
-      [[#include <curl/curl.h>]]
-    )
   fi
 fi
 
@@ -2441,12 +2371,6 @@ if test "x$with_libcurl" = "xyes"; then
   if test "x$have_curlopt_timeout" = "xyes"; then
     AC_DEFINE([HAVE_CURLOPT_TIMEOUT_MS], [1],
       [Define if libcurl supports CURLOPT_TIMEOUT_MS option.]
-    )
-  fi
-
-  if test "x$have_curlopt_unix_socket_path" = "xyes"; then
-    AC_DEFINE([HAVE_CURLOPT_UNIX_SOCKET_PATH], [1],
-      [Define if libcurl supports CURLOPT_UNIX_SOCKET_PATH option.]
     )
   fi
 fi
@@ -2676,34 +2600,15 @@ if test "x$with_libganglia" = "xyes"; then
   fi
 fi
 
-AC_CHECK_HEADERS([rpc/types.h],
-  [have_rpc_types_h="yes"],
-  [have_rpc_types_h="no"]
-)
-AS_UNSET([ac_cv_header_rpc_types_h])
-if test "x$have_rpc_types_h" = "xno"; then
-  # SunRPC has been removed from glibc.
-  # Replacement headers are in the "tirpc" subdirectory.
-  SAVE_CPPFLAGS="$CPPFLAGS"
-  CPPFLAGS="$CPPFLAGS -I/usr/include/tirpc"
-
-  AC_CHECK_HEADERS([rpc/types.h],
-    [GANGLIA_CPPFLAGS="$GANGLIA_CPPFLAGS -I/usr/include/tirpc"],
-    [with_libganglia="no (rpc/types.h not found)"]
-  )
-
-  CPPFLAGS="$SAVE_CPPFLAGS"
-fi
-
 SAVE_CPPFLAGS="$CPPFLAGS"
 SAVE_LDFLAGS="$LDFLAGS"
 CPPFLAGS="$CPPFLAGS $GANGLIA_CPPFLAGS"
 LDFLAGS="$LDFLAGS $GANGLIA_LDFLAGS"
 
 if test "x$with_libganglia" = "xyes"; then
-  AC_CHECK_HEADERS([ganglia.h],
+  AC_CHECK_HEADERS([gm_protocol.h],
     [with_libganglia="yes"],
-    [with_libganglia="no (ganglia.h not found)"]
+    [with_libganglia="no (gm_protocol.h not found)"]
   )
 fi
 
@@ -2723,27 +2628,48 @@ AC_SUBST(GANGLIA_LIBS)
 # }}}
 
 # --with-libgcrypt {{{
+GCRYPT_CPPFLAGS="$GCRYPT_CPPFLAGS"
+GCRYPT_LDFLAGS="$GCRYPT_LDFLAGS"
+GCRYPT_LIBS="$GCRYPT_LIBS"
 AC_ARG_WITH([libgcrypt],
-  [AS_HELP_STRING([--with-libgcrypt], [Use libgcrypt (default is auto)])],
+  [AS_HELP_STRING([--with-libgcrypt@<:@=PREFIX@:>@], [Path to libgcrypt.])],
   [
-    with_libgcrypt="$withval"
-    if test "x$withval" = "xno"; then
-      with_libgcrypt="no (disabled on command line)"
-    fi
+    if test -f "$withval" && test -x "$withval"; then
+      with_libgcrypt_config="$withval"
+      with_libgcrypt="yes"
+    else if test -f "$withval/bin/gcrypt-config" && test -x "$withval/bin/gcrypt-config"; then
+      with_libgcrypt_config="$withval/bin/gcrypt-config"
+      with_libgcrypt="yes"
+    else if test -d "$withval"; then
+      GCRYPT_CPPFLAGS="$GCRYPT_CPPFLAGS -I$withval/include"
+      GCRYPT_LDFLAGS="$GCRYPT_LDFLAGS -L$withval/lib"
+      with_libgcrypt="yes"
+    else
+      with_libgcrypt_config="gcrypt-config"
+      with_libgcrypt="$withval"
+    fi; fi; fi
   ],
-  [with_libgcrypt="yes"]
+  [
+    with_libgcrypt_config="libgcrypt-config"
+    with_libgcrypt="yes"
+  ]
 )
 
-if test "x$with_libgcrypt" = "xyes"; then
-  PKG_CHECK_MODULES([GCRYPT], [libgcrypt],
-    [],
-    [with_libgcrypt="no (pkg-config could not find libgcrypt)"]
-  )
+if test "x$with_libgcrypt" = "xyes" && test "x$with_libgcrypt_config" != "x"; then
+  if test "x$GCRYPT_CPPFLAGS" = "x"; then
+    GCRYPT_CPPFLAGS=`"$with_libgcrypt_config" --cflags 2>/dev/null`
+  fi
+
+  if test "x$GCRYPT_LIBS" = "x"; then
+    GCRYPT_LIBS=`"$with_libgcrypt_config" --libs 2>/dev/null`
+  fi
 fi
 
 SAVE_CPPFLAGS="$CPPFLAGS"
+SAVE_LDFLAGS="$LDFLAGS"
 SAVE_LIBS="$LIBS"
-CPPFLAGS="$CPPFLAGS $GCRYPT_CFLAGS"
+CPPFLAGS="$CPPFLAGS $GCRYPT_CPPFLAGS"
+LDFLAGS="$LDFLAGS $GCRYPT_LDFLAGS"
 LIBS="$LIBS $GCRYPT_LIBS"
 
 if test "x$with_libgcrypt" = "xyes"; then
@@ -2754,16 +2680,18 @@ if test "x$with_libgcrypt" = "xyes"; then
 fi
 
 if test "x$with_libgcrypt" = "xyes"; then
-  AC_CHECK_FUNC([gcry_md_hash_buffer],
+  AC_CHECK_LIB(gcrypt, gcry_md_hash_buffer,
     [with_libgcrypt="yes"],
     [with_libgcrypt="no (symbol gcry_md_hash_buffer not found)"]
   )
 fi
 
 CPPFLAGS="$SAVE_CPPFLAGS"
+LDFLAGS="$SAVE_LDFLAGS"
 LIBS="$SAVE_LIBS"
 
-AC_SUBST([GCRYPT_CFLAGS])
+AC_SUBST([GCRYPT_CPPFLAGS])
+AC_SUBST([GCRYPT_LDFLAGS])
 AC_SUBST([GCRYPT_LIBS])
 AM_CONDITIONAL([BUILD_WITH_LIBGCRYPT], [test "x$with_libgcrypt" = "xyes"])
 # }}}
@@ -2844,20 +2772,20 @@ PKG_CHECK_MODULES([GRPCPP], [grpc++],
 fi
 
 if test "x$withval" != "xno"; then
-  AC_MSG_CHECKING([whether $CXX accepts -std=c++17])
-  if test_cxx_flags -std=c++17; then
+  AC_MSG_CHECKING([whether $CXX accepts -std=c++11])
+  if test_cxx_flags -std=c++11; then
     AC_MSG_RESULT([yes])
   else
     AC_MSG_RESULT([no])
-    with_libgrpcpp="no (requires C++17 support)"
-    with_libprotobuf="no (<absl/base/policy_checks.h> requires C++17 support)"
+    with_libgrpcpp="no (requires C++11 support)"
+    with_libprotobuf="no (<google/protobuf/util/time_util.h> requires C++11 support)"
   fi
 fi
 
 if test "x$with_libgrpcpp" = "xyes"; then
   AC_LANG_PUSH(C++)
   SAVE_CPPFLAGS="$CPPFLAGS"
-  CPPFLAGS="-std=c++17 $with_libgrpcpp_cppflags $GRPCPP_CFLAGS $CPPFLAGS"
+  CPPFLAGS="-std=c++11 $with_libgrpcpp_cppflags $GRPCPP_CFLAGS $CPPFLAGS"
   AC_CHECK_HEADERS([grpc++/grpc++.h],
     [with_libgrpcpp="yes"],
     [with_libgrpcpp="no (<grpc++/grpc++.h> not found)"]
@@ -2871,7 +2799,7 @@ if test "x$with_libgrpcpp" = "xyes"; then
   SAVE_CPPFLAGS="$CPPFLAGS"
   SAVE_LDFLAGS="$LDFLAGS"
   SAVE_LIBS="$LIBS"
-  CPPFLAGS="-std=c++17 $with_libgrpcpp_cppflags $GRPCPP_CFLAGS $CPPFLAGS"
+  CPPFLAGS="-std=c++11 $with_libgrpcpp_cppflags $GRPCPP_CFLAGS $CPPFLAGS"
   LDFLAGS="$with_libgrpcpp_ldflags"
   if test "x$GRPCPP_LIBS" = "x"; then
     LIBS="-lgrpc++"
@@ -2899,7 +2827,7 @@ if test "x$with_libgrpcpp" = "xyes"; then
   AC_LANG_POP(C++)
 fi
 
-BUILD_WITH_LIBGRPCPP_CPPFLAGS="-std=c++17 $with_libgrpcpp_cppflags $GRPCPP_CFLAGS"
+BUILD_WITH_LIBGRPCPP_CPPFLAGS="-std=c++11 $with_libgrpcpp_cppflags $GRPCPP_CFLAGS"
 BUILD_WITH_LIBGRPCPP_LDFLAGS="$with_libgrpcpp_ldflags"
 BUILD_WITH_LIBGRPCPP_LIBS="$GRPCPP_LIBS"
 AC_SUBST([BUILD_WITH_LIBGRPCPP_CPPFLAGS])
@@ -3241,14 +3169,7 @@ else
                                     [
                                       PKG_CHECK_MODULES([LUA], [lua51],
                                         [with_liblua="yes"],
-                                        [
-                                          PKG_CHECK_MODULES([LUA], [luajit],
-                                            [
-                                              with_liblua="yes"
-                                            ],
-                                            [with_liblua="no (pkg-config cannot find libluajit)"]
-					  )
-					]
+                                        [with_liblua="no (pkg-config cannot find liblua)"]
                                       )
                                     ]
                                   )
@@ -3894,7 +3815,7 @@ AC_ARG_WITH([libnetsnmp],
      with_libnetsnmp="yes"
     else
       with_libnetsnmp_cppflags="-I$withval/include"
-      with_libnetsnmp_ldflags="-L$withval/lib"
+      with_libnetsnmp_ldflags="-I$withval/lib"
       with_libnetsnmp="yes"
     fi; fi
   ],
@@ -4015,7 +3936,7 @@ AC_ARG_WITH([libnetsnmpagent],
       with_libnetsnmpagent="yes"
     else
       with_libnetsnmpagent_cppflags="-I$withval/include"
-      with_libnetsnmpagent_ldflags="-L$withval/lib"
+      with_libnetsnmpagent_ldflags="-I$withval/lib"
       with_libnetsnmpagent="yes"
     fi; fi
   ],
@@ -4843,7 +4764,7 @@ if test "x$withval" != "xno"; then
   AC_CHECK_LIB([protobuf], [main],
     [
       SAVE_CPPFLAGS="$CPPFLAGS"
-      CPPFLAGS="-std=c++17 $with_libprotobuf_cppflags $PROTOBUF_CFLAGS"
+      CPPFLAGS="-std=c++11 $with_libprotobuf_cppflags $PROTOBUF_CFLAGS"
       if test "x$PROTOBUF_LIBS" = "x"
       then
         PROTOBUF_LIBS="-lprotobuf"
@@ -5093,12 +5014,10 @@ if test "x$with_librabbitmq" = "xyes"; then
   SAVE_CPPFLAGS="$CPPFLAGS"
   CPPFLAGS="$CPPFLAGS $with_librabbitmq_cppflags"
 
-  with_librabbitmq="no (amqp.h and rabbitmq-c/amqp.h not found)"
-  AC_CHECK_HEADERS([rabbitmq-c/amqp.h], [with_librabbitmq="yes"], [])
-  AC_CHECK_HEADERS([amqp.h], [with_librabbitmq="yes"], [])
-
-  AC_CHECK_HEADERS([rabbitmq-c/framing.h rabbitmq-c/ssl_socket.h rabbitmq-c/tcp_socket.h \
-                    amqp_framing.h amqp_ssl_socket.h amqp_tcp_socket.h])
+  AC_CHECK_HEADERS([amqp.h],
+    [with_librabbitmq="yes"],
+    [with_librabbitmq="no (amqp.h not found)"]
+  )
 
   CPPFLAGS="$SAVE_CPPFLAGS"
 fi
@@ -5119,11 +5038,7 @@ if test "x$with_librabbitmq" = "xyes"; then
       #include <stdio.h>
       #include <stdint.h>
       #include <inttypes.h>
-      #if HAVE_RABBITMQ_C_AMQP_H
-      # include <rabbitmq-c/amqp.h>
-      #else
-      # include <amqp.h>
-      #endif
+      #include <amqp.h>
     ]]
   )
   CPPFLAGS="$SAVE_CPPFLAGS"
@@ -5137,6 +5052,41 @@ if test "x$with_librabbitmq" = "xyes"; then
   )
 
   LDFLAGS="$SAVE_LDFLAGS"
+fi
+
+if test "x$with_librabbitmq" = "xyes"; then
+  SAVE_CPPFLAGS="$CPPFLAGS"
+  SAVE_LDFLAGS="$LDFLAGS"
+  SAVE_LIBS="$LIBS"
+  CPPFLAGS="$CPPFLAGS $with_librabbitmq_cppflags"
+  LDFLAGS="$LDFLAGS $with_librabbitmq_ldflags"
+  LIBS="-lrabbitmq"
+
+  AC_CHECK_HEADERS([amqp_tcp_socket.h amqp_socket.h])
+  AC_CHECK_FUNC([amqp_tcp_socket_new],
+    [
+      AC_DEFINE([HAVE_AMQP_TCP_SOCKET], [1],
+        [Define if librabbitmq provides the new TCP socket interface.])
+    ]
+  )
+
+  AC_CHECK_DECLS([amqp_socket_close],
+    [],
+    [],
+    [[
+      #include <amqp.h>
+      #ifdef HAVE_AMQP_TCP_SOCKET_H
+      # include <amqp_tcp_socket.h>
+      #endif
+      #ifdef HAVE_AMQP_SOCKET_H
+      # include <amqp_socket.h>
+      #endif
+    ]]
+  )
+
+  CPPFLAGS="$SAVE_CPPFLAGS"
+  LDFLAGS="$SAVE_LDFLAGS"
+  LIBS="$SAVE_LIBS"
 fi
 
 if test "x$with_librabbitmq" = "xyes"; then
@@ -5495,6 +5445,7 @@ if test "x$with_libssl" = "xyes"; then
 	AC_SUBST([BUILD_WITH_LIBSSL_LDFLAGS])
 	AC_SUBST([BUILD_WITH_LIBSSL_LIBS])
 	AC_DEFINE([HAVE_LIBSSL], [1], [Define if libssl is present and usable.])
+	AC_DEFINE([HAVE_OPENSSL], [1], [Define if OpenSSL is present and usable.])
 fi
 AM_CONDITIONAL(BUILD_WITH_LIBSSL, test "x$with_libssl" = "xyes")
 # }}}
@@ -5855,128 +5806,18 @@ fi
 if test "x$with_libupsclient" = "xyes"; then
   SAVE_CPPFLAGS="$CPPFLAGS"
   CPPFLAGS="$CPPFLAGS $with_libupsclient_cflags"
-  someUPSCONN_FOUND=false
 
   AC_CHECK_TYPES([UPSCONN_t, UPSCONN],
-    [someUPSCONN_FOUND=true],
+    [],
     [],
     [[
       #include <stdlib.h>
       #include <stdio.h>
-      #include <time.h>
       #include <upsclient.h>
     ]]
   )
 
-  AS_IF([test x"$someUPSCONN_FOUND" = xfalse],
-    [AC_MSG_WARN([Can not find either UPSCONN or UPSCONN_t type definition for upsclient library])
-     with_libupsclient="no (required data types for NUT API were not detected)"]
-  )
-
-  unset someUPSCONN_FOUND
   CPPFLAGS="$SAVE_CPPFLAGS"
-fi
-
-if test "x$with_libupsclient" = "xyes"; then
-  dnl The m4 script logic below is modelled after NUT_FUNC_GETNAMEINFO_ARGTYPES
-  dnl further originating in curl autoconf scripts or beyond. See there for an
-  dnl example of general-case logic to handle matching of numerous possible
-  dnl data types for each argument in supported API variants.
-  dnl Note: techically compiler complains here not about int types themselves,
-  dnl but about pointers to such data. We know "out of band" that e.g. NUT
-  dnl change to "size_t" happened at once for all arguments in the API, so
-  dnl simplify the handling here and now with that assumption.
-  AC_LANG_PUSH([C])
-  SAVE_CPPFLAGS="$CPPFLAGS"
-  SAVE_LDFLAGS="$LDFLAGS"
-  SAVE_CFLAGS="$CFLAGS"
-  CPPFLAGS="$CPPFLAGS $with_libupsclient_cflags"
-  LDFLAGS="$LDFLAGS $with_libupsclient_libs"
-  CFLAGS="$CFLAGS $with_libupsclient_cflags"
-  if test "x$GCC" = "xyes"; then
-    CFLAGS="$CFLAGS -Wall -Werror"
-  fi
-
-  dnl upscli_splitname() *is* there forever (2007 or older)
-  dnl but int types e.g. "port" changed in NUT 2.8.0
-  dnl Also this is the UPSCONN_t::port field type:
-  AC_CACHE_CHECK([int type of port argument for NUT upscli_splitname],
-    [collectd_cv_func_upscli_splitname_args], [
-     collectd_cv_func_upscli_splitname_args="unknown"
-     for port_arg in 'uint16_t' 'int' ; do
-        AC_COMPILE_IFELSE([
-            AC_LANG_PROGRAM([
-#include <time.h>
-#include <upsclient.h>
-/* int upscli_splitname(const char *buf, char **upsname, char **hostname, <port_arg> *port); */
-            ],[
-const char *origname = "ups@localhost:3493";
-$port_arg port=0;
-char *hostname;
-char *upsname;
-int res = upscli_splitname(origname, &upsname, &hostname, &port);
-return(res);
-            ])
-        ],[
-            collectd_cv_func_upscli_splitname_args="$port_arg"
-            break
-        ])
-     done
-    ])
-
-  AS_IF([test x"$collectd_cv_func_upscli_splitname_args" = xunknown],
-    [AC_MSG_WARN([Can not find proper port type for upscli_splitname()])
-     with_libupsclient="no (required data types for NUT API were not detected)"],
-    [AC_DEFINE_UNQUOTED(NUT_PORT_TYPE, $collectd_cv_func_upscli_splitname_args,
-        [Define to the integer type for TCP/IP ports used by NUT API we build against])
-    ])
-
-
-  AC_CACHE_CHECK([int type of length/numbering arguments for NUT upscli_list_next],
-    [collectd_cv_func_upscli_list_next_args], [
-     collectd_cv_func_upscli_list_next_args="unknown"
-     for size_arg in 'size_t' 'unsigned int' 'int' ; do
-        AC_COMPILE_IFELSE([
-            AC_LANG_PROGRAM([
-#include <time.h>
-#include <upsclient.h>
-/* int upscli_list_next(UPSCONN_t *ups, <size_arg> numq, const char **query, <size_arg> *numa, char ***answer); */
-
-#if HAVE_UPSCONN_T
-typedef UPSCONN_t collectd_upsconn_t;
-#elif HAVE_UPSCONN
-typedef UPSCONN collectd_upsconn_t;
-#else
-#error "Unable to determine the UPS connection type."
-#endif
-            ],[
-$size_arg query_num=0;
-$size_arg answer_num=0;
-const char * query;
-char** answer;
-collectd_upsconn_t ups;
-int res = upscli_list_next(&ups, query_num, &query, &answer_num, &answer);
-return(res);
-            ])
-        ],[
-            collectd_cv_func_upscli_list_next_args="$size_arg"
-            break
-        ])
-     done
-    ])
-
-  AS_IF([test x"$collectd_cv_func_upscli_list_next_args" = xunknown],
-    [AC_MSG_WARN([Can not find proper type for array sizes and string lengths used by upscli_list_next()])
-     with_libupsclient="no (required data types for NUT API were not detected)"],
-    [AC_DEFINE_UNQUOTED(NUT_SIZE_TYPE, $collectd_cv_func_upscli_list_next_args,
-        [Define to the integer type for array sizes and string lengths used by NUT API we build against])
-    ])
-
-
-  CPPFLAGS="$SAVE_CPPFLAGS"
-  LDFLAGS="$SAVE_LDFLAGS"
-  CFLAGS="$SAVE_CFLAGS"
-  AC_LANG_POP([C])
 fi
 
 if test "x$with_libupsclient" = "xyes"; then
@@ -5986,6 +5827,55 @@ fi
 
 AC_SUBST([BUILD_WITH_LIBUPSCLIENT_CFLAGS])
 AC_SUBST([BUILD_WITH_LIBUPSCLIENT_LIBS])
+# }}}
+
+# --with-libtaos {{{
+AC_ARG_WITH([libtaos],
+  [AS_HELP_STRING([--with-libtaos@<:@=PREFIX@:>@], [Path to libtaos (TDengine client library).])],
+  [
+    if test "x$withval" = "xyes"; then
+      with_libtaos="yes"
+    else if test "x$withval" = "xno"; then
+      with_libtaos="no"
+    else
+      with_libtaos="yes"
+      LIBTAOS_CPPFLAGS="$LIBTAOS_CPPFLAGS -I$withval/include"
+      LIBTAOS_LDFLAGS="$LIBTAOS_LDFLAGS -L$withval/lib"
+    fi; fi
+  ],
+  [with_libtaos="yes"]
+)
+
+SAVE_CPPFLAGS="$CPPFLAGS"
+SAVE_LDFLAGS="$LDFLAGS"
+CPPFLAGS="$CPPFLAGS $LIBTAOS_CPPFLAGS"
+LDFLAGS="$LDFLAGS $LIBTAOS_LDFLAGS"
+
+if test "x$with_libtaos" = "xyes"; then
+  AC_CHECK_HEADERS([taos.h],
+    [with_libtaos="yes"],
+    [with_libtaos="no (taos.h not found)"]
+  )
+fi
+
+if test "x$with_libtaos" = "xyes"; then
+  AC_CHECK_LIB([taos], [taos_connect],
+    [
+      with_libtaos="yes"
+      LIBTAOS_LIBS="-ltaos"
+    ],
+    [with_libtaos="no (libtaos not found)"]
+  )
+fi
+
+CPPFLAGS="$SAVE_CPPFLAGS"
+LDFLAGS="$SAVE_LDFLAGS"
+
+AC_SUBST([BUILD_WITH_LIBTAOS_CPPFLAGS], [$LIBTAOS_CPPFLAGS])
+AC_SUBST([BUILD_WITH_LIBTAOS_LDFLAGS], [$LIBTAOS_LDFLAGS])
+AC_SUBST([BUILD_WITH_LIBTAOS_LIBS], [$LIBTAOS_LIBS])
+
+AM_CONDITIONAL([BUILD_WITH_LIBTAOS], [test "x$with_libtaos" = "xyes"])
 # }}}
 
 # --with-libxenctrl {{{
@@ -6380,12 +6270,12 @@ fi
 if test "x$with_libvirt" = "xyes"; then
   with_libvirt_cflags="`$PKG_CONFIG --cflags libvirt`"
   if test $? -ne 0; then
-    with_libvirt="no (pkg-config --cflags failed)"
+    with_libvirt="no"
   fi
 
   with_libvirt_ldflags="`$PKG_CONFIG --libs libvirt`"
   if test $? -ne 0; then
-    with_libvirt="no (pkg-config --cflags failed)"
+    with_libvirt="no"
   fi
 fi
 
@@ -6767,7 +6657,6 @@ plugin_dpdkevents="no"
 plugin_dpdkstat="no"
 plugin_dpdk_telemetry="no"
 plugin_entropy="no"
-plugin_epics="no"
 plugin_ethstat="no"
 plugin_fhcount="no"
 plugin_fscache="no"
@@ -6789,7 +6678,6 @@ plugin_log_logstash="no"
 plugin_mcelog="no"
 plugin_mdevents="no"
 plugin_memory="no"
-plugin_mmc="no"
 plugin_multimeter="no"
 plugin_netstat_udp="no"
 plugin_nfs="no"
@@ -6803,7 +6691,6 @@ plugin_processes="no"
 plugin_procevent="no"
 plugin_protocols="no"
 plugin_python="no"
-plugin_ras="no"
 plugin_serial="no"
 plugin_smart="no"
 plugin_swap="no"
@@ -6811,6 +6698,7 @@ plugin_synproxy="no"
 plugin_sysevent="no"
 plugin_tape="no"
 plugin_tcpconns="no"
+plugin_tcpsock="no"
 plugin_ted="no"
 plugin_thermal="no"
 plugin_turbostat="no"
@@ -7114,10 +7002,6 @@ if test "x$have_termios_h" = "xyes"; then
   plugin_ted="yes"
 fi
 
-if test "x$with_libudev" = "xyes"; then
-  plugin_mmc="yes"
-fi
-
 if test "x$have_thread_info" = "xyes"; then
   plugin_processes="yes"
 fi
@@ -7132,10 +7016,6 @@ fi
 
 if test "x$with_libpython" != "xno"; then
   plugin_python="yes"
-fi
-
-if test "x$with_sqlite3" = "xyes"; then
-  plugin_ras="yes"
 fi
 
 if test "x$with_libatasmart" = "xyes" && test "x$with_libudev" = "xyes"; then
@@ -7168,13 +7048,6 @@ fi
 
 if test "x$with_libxml2" = "xyes" && test "x$with_libvirt" = "xyes"; then
   plugin_virt="yes"
-else
-  plugin_virt="no"
-  if test "x$with_libvirt" != "xyes"; then
-    plugin_virt="$with_libvirt"
-  elif test "x$with_libxml2" != "xyes"; then
-    plugin_virt="$with_libxml2"
-  fi
 fi
 
 if test "x$with_libxenctrl" = "xyes"; then
@@ -7247,7 +7120,6 @@ AC_PLUGIN([dpdk_telemetry],      [$plugin_dpdk_telemetry],    [Metrics from DPDK
 AC_PLUGIN([drbd],                [$plugin_drbd],              [DRBD statistics])
 AC_PLUGIN([email],               [yes],                       [EMail statistics])
 AC_PLUGIN([entropy],             [$plugin_entropy],           [Entropy statistics])
-AC_PLUGIN([epics],               [$with_epics_base],          [EPICS CA plugin])
 AC_PLUGIN([ethstat],             [$plugin_ethstat],           [Stats from NIC driver])
 AC_PLUGIN([exec],                [yes],                       [Execution of external programs])
 AC_PLUGIN([fhcount],             [$plugin_fhcount],           [File handles statistics])
@@ -7292,7 +7164,6 @@ AC_PLUGIN([memory],              [$plugin_memory],            [Memory usage])
 AC_PLUGIN([mic],                 [$with_mic],                 [Intel Many Integrated Core stats])
 AC_PLUGIN([modbus],              [$with_libmodbus],           [Modbus plugin])
 AC_PLUGIN([mqtt],                [$with_libmosquitto],        [MQTT output plugin])
-AC_PLUGIN([mmc],                 [$plugin_mmc],               [MMC statistics])
 AC_PLUGIN([multimeter],          [$plugin_multimeter],        [Read multimeter values])
 AC_PLUGIN([mysql],               [$with_libmysql],            [MySQL statistics])
 AC_PLUGIN([netapp],              [$with_libnetapp],           [NetApp plugin])
@@ -7326,7 +7197,6 @@ AC_PLUGIN([processes],           [$plugin_processes],         [Process statistic
 AC_PLUGIN([procevent],           [$plugin_procevent],         [Process event (start, stop) statistics])
 AC_PLUGIN([protocols],           [$plugin_protocols],         [Protocol (IP, TCP, ...) statistics])
 AC_PLUGIN([python],              [$plugin_python],            [Embed a Python interpreter])
-AC_PLUGIN([ras],                 [$plugin_ras],               [RAS plugin])
 AC_PLUGIN([redfish],             [$with_libredfish],          [Redfish plugin])
 AC_PLUGIN([redis],               [$with_libhiredis],          [Redis plugin])
 AC_PLUGIN([routeros],            [$with_librouteros],         [RouterOS plugin])
@@ -7362,6 +7232,7 @@ AC_PLUGIN([tokyotyrant],         [$with_libtokyotyrant],      [TokyoTyrant datab
 AC_PLUGIN([turbostat],           [$plugin_turbostat],         [Advanced statistic on Intel cpu states])
 AC_PLUGIN([ubi],                 [$plugin_ubi],               [UBIFS statistics])
 AC_PLUGIN([unixsock],            [yes],                       [Unixsock communication plugin])
+AC_PLUGIN([tcpsock],             [yes],                       [TCP socket communication plugin with TLS support])
 AC_PLUGIN([uptime],              [$plugin_uptime],            [Uptime statistics])
 AC_PLUGIN([users],               [$plugin_users],             [User statistics])
 AC_PLUGIN([uuid],                [yes],                       [UUID as hostname plugin])
@@ -7382,6 +7253,7 @@ AC_PLUGIN([write_riemann],       [$with_libriemann_client],   [Riemann output pl
 AC_PLUGIN([write_sensu],         [yes],                       [Sensu output plugin])
 AC_PLUGIN([write_stackdriver],   [$plugin_write_stackdriver], [Google Stackdriver Monitoring output plugin])
 AC_PLUGIN([write_syslog],        [yes],                       [Syslog output plugin])
+AC_PLUGIN([write_tdengine],      [$with_libtaos],                       [TDengine output plugin])
 AC_PLUGIN([write_tsdb],          [yes],                       [TSDB output plugin])
 AC_PLUGIN([xencpu],              [$plugin_xencpu],            [Xen Host CPU usage])
 AC_PLUGIN([xmms],                [$with_libxmms],             [XMMS statistics])
@@ -7581,7 +7453,6 @@ AC_MSG_RESULT([    YACC  . . . . . . . . $YACC])
 AC_MSG_RESULT([    YFLAGS  . . . . . . . $YFLAGS])
 AC_MSG_RESULT()
 AC_MSG_RESULT([  Libraries:])
-AC_MSG_RESULT([    epics . . . . . . . . $with_epics_base])
 AC_MSG_RESULT([    intel mic . . . . . . $with_mic])
 AC_MSG_RESULT([    libaquaero5 . . . . . $with_libaquaero5])
 AC_MSG_RESULT([    libatasmart . . . . . $with_libatasmart])
@@ -7699,7 +7570,6 @@ AC_MSG_RESULT([    drbd  . . . . . . . . $enable_drbd])
 AC_MSG_RESULT([    email . . . . . . . . $enable_email])
 AC_MSG_RESULT([    entropy . . . . . . . $enable_entropy])
 AC_MSG_RESULT([    ethstat . . . . . . . $enable_ethstat])
-AC_MSG_RESULT([    epics . . . . . . . . $enable_epics])
 AC_MSG_RESULT([    exec  . . . . . . . . $enable_exec])
 AC_MSG_RESULT([    fhcount . . . . . . . $enable_fhcount])
 AC_MSG_RESULT([    filecount . . . . . . $enable_filecount])
@@ -7741,7 +7611,6 @@ AC_MSG_RESULT([    memcachec . . . . . . $enable_memcachec])
 AC_MSG_RESULT([    memcached . . . . . . $enable_memcached])
 AC_MSG_RESULT([    memory  . . . . . . . $enable_memory])
 AC_MSG_RESULT([    mic . . . . . . . . . $enable_mic])
-AC_MSG_RESULT([    mmc . . . . . . . . . $enable_mmc])
 AC_MSG_RESULT([    modbus  . . . . . . . $enable_modbus])
 AC_MSG_RESULT([    mqtt  . . . . . . . . $enable_mqtt])
 AC_MSG_RESULT([    multimeter  . . . . . $enable_multimeter])
@@ -7776,7 +7645,6 @@ AC_MSG_RESULT([    processes . . . . . . $enable_processes])
 AC_MSG_RESULT([    procevent . . . . . . $enable_procevent])
 AC_MSG_RESULT([    protocols . . . . . . $enable_protocols])
 AC_MSG_RESULT([    python  . . . . . . . $enable_python])
-AC_MSG_RESULT([    ras . . . . . . . . . $enable_ras])
 AC_MSG_RESULT([    redfish . . . . . . . $enable_redfish])
 AC_MSG_RESULT([    redis . . . . . . . . $enable_redis])
 AC_MSG_RESULT([    routeros  . . . . . . $enable_routeros])
@@ -7812,6 +7680,8 @@ AC_MSG_RESULT([    tokyotyrant . . . . . $enable_tokyotyrant])
 AC_MSG_RESULT([    turbostat . . . . . . $enable_turbostat])
 AC_MSG_RESULT([    ubi . . . . . . . . . $enable_ubi])
 AC_MSG_RESULT([    unixsock  . . . . . . $enable_unixsock])
+AC_MSG_RESULT([    tcpsock . . . . . . . $enable_tcpsock])
+AC_MSG_RESULT([    tcpsock . . . . . . . $enable_tcpsock])
 AC_MSG_RESULT([    uptime  . . . . . . . $enable_uptime])
 AC_MSG_RESULT([    users . . . . . . . . $enable_users])
 AC_MSG_RESULT([    uuid  . . . . . . . . $enable_uuid])
@@ -7832,6 +7702,7 @@ AC_MSG_RESULT([    write_riemann . . . . $enable_write_riemann])
 AC_MSG_RESULT([    write_sensu . . . . . $enable_write_sensu])
 AC_MSG_RESULT([    write_stackdriver . . $enable_write_stackdriver])
 AC_MSG_RESULT([    write_syslog . .  . . $enable_write_syslog])
+AC_MSG_RESULT([    write_tdengine. . . . $enable_write_tdengine])
 AC_MSG_RESULT([    write_tsdb  . . . . . $enable_write_tsdb])
 AC_MSG_RESULT([    xencpu  . . . . . . . $enable_xencpu])
 AC_MSG_RESULT([    xmms  . . . . . . . . $enable_xmms])

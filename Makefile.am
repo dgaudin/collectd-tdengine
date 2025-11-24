@@ -2203,6 +2203,18 @@ unixsock_la_LDFLAGS = $(PLUGIN_LDFLAGS)
 unixsock_la_LIBADD = libcmds.la
 endif
 
+if BUILD_PLUGIN_TCPSOCK
+pkglib_LTLIBRARIES += tcpsock.la
+tcpsock_la_SOURCES = src/tcpsock.c
+tcpsock_la_CFLAGS = $(AM_CFLAGS)
+tcpsock_la_LDFLAGS = $(PLUGIN_LDFLAGS)
+tcpsock_la_LIBADD = libcmds.la
+if BUILD_WITH_LIBSSL
+tcpsock_la_CFLAGS += $(BUILD_WITH_LIBSSL_CFLAGS)
+tcpsock_la_LIBADD += $(BUILD_WITH_LIBSSL_LIBS)
+endif
+endif
+
 if BUILD_PLUGIN_UPTIME
 pkglib_LTLIBRARIES += uptime.la
 uptime_la_SOURCES = src/uptime.c
