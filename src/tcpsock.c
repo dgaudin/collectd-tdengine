@@ -310,9 +310,6 @@ static void *us_handle_client(void *arg) {
     FILE *fhin = NULL;
     FILE *fhout = NULL;
 
-    DEBUG("tcpsock plugin: us_handle_client: Reading from fd #%i (TLS: %s)",
-          ctx->fd, ctx->is_tls ? "yes" : "no");
-
 #ifdef HAVE_OPENSSL
     /* Perform TLS handshake if TLS is enabled */
     if (ctx->is_tls) {
@@ -483,8 +480,6 @@ static void *us_handle_client(void *arg) {
         }
     }
 
-    DEBUG("tcpsock plugin: us_handle_client: Exiting..");
-
 #ifdef HAVE_OPENSSL
     if (ctx->ssl != NULL) {
         SSL_shutdown(ctx->ssl);
@@ -516,7 +511,6 @@ static void *us_server_thread(void __attribute__((unused)) * arg) {
         pthread_exit((void *)1);
 
     while (loop != 0) {
-        DEBUG("tcpsock plugin: Calling accept..");
         status = accept(sock_fd, NULL, NULL);
         if (status < 0) {
             char errbuf[1024];
@@ -551,8 +545,6 @@ static void *us_server_thread(void __attribute__((unused)) * arg) {
 #ifdef HAVE_OPENSSL
         ctx->ssl = NULL;
 #endif
-
-        DEBUG("Spawning child to handle connection on fd #%i", ctx->fd);
 
         pthread_attr_init(&th_attr);
         pthread_attr_setdetachstate(&th_attr, PTHREAD_CREATE_DETACHED);
