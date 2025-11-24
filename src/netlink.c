@@ -371,9 +371,6 @@ static int submit_cake_tin(const char *dev, const char *tc_inst, int tin_idx,
   sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
 
   /* DEBUG: Log what we're submitting */
-  INFO("netlink plugin: CAKE submit_cake_tin: dev=%s, tin_idx=%d, plugin_instance=%s, type=%s, suffix=%s",
-       dev, tin_idx, vl.plugin_instance, type, suffix ? suffix : "NULL");
-
   sstrncpy(vl.type, type, sizeof(vl.type));
 
   /* Format type_instance: "cake-4:0" or "peak-cake-4:0" */
@@ -418,10 +415,6 @@ static int submit_cake_tin_gauge(const char *dev, const char *tc_inst, int tin_i
     return -1;
   }
   sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
-
-  /* DEBUG: Log what we're submitting */
-  INFO("netlink plugin: CAKE submit_cake_tin_gauge: dev=%s, tin_idx=%d, plugin_instance=%s, type=%s, suffix=%s",
-       dev, tin_idx, vl.plugin_instance, type, suffix ? suffix : "NULL");
 
   sstrncpy(vl.type, type, sizeof(vl.type));
 
@@ -1286,10 +1279,6 @@ static int qos_filter_cb(const struct nlmsghdr *nlh, void *args) {
         if (xstats_len >= sizeof(struct tc_fq_qd_stats)) {
           const struct tc_fq_qd_stats *fq_stats = (const struct tc_fq_qd_stats *)xstats_data;
 
-          DEBUG("netlink plugin: FQ xstats for %s: flows=%u, throttled_flows=%u, throttled=%llu",
-                dev, fq_stats->flows, fq_stats->throttled_flows,
-                (unsigned long long)fq_stats->throttled);
-
           /* Submit FQ-specific stats as gauges and derives */
           char fq_inst[DATA_MAX_NAME_LEN];
 
@@ -1370,10 +1359,7 @@ static int qos_filter_cb(const struct nlmsghdr *nlh, void *args) {
           if (fqc_xstats->type == TCA_FQ_CODEL_XSTATS_QDISC) {
             const struct tc_fq_codel_qd_stats *qd_stats = &fqc_xstats->qdisc_stats;
 
-            DEBUG("netlink plugin: FQ_CODEL xstats for %s: new_flows=%u, ecn_mark=%u",
-                  dev, qd_stats->new_flow_count, qd_stats->ecn_mark);
-
-            char fqc_inst[DATA_MAX_NAME_LEN];
+           char fqc_inst[DATA_MAX_NAME_LEN];
 
             /* Gauges: Current state */
             int status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-new-flows-len", tc_inst);
