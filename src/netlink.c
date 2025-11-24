@@ -50,6 +50,22 @@
 #include <glob.h>
 #include <libmnl/libmnl.h>
 
+/* CAKE qdisc support - storage for tin statistics */
+struct cake_tin_data {
+  uint64_t sent_bytes;
+  uint32_t sent_packets;
+  uint32_t dropped_packets;
+  uint32_t ecn_marked_packets;
+  uint32_t backlog_bytes;
+  uint32_t backlog_packets;
+  uint32_t peak_delay_us;
+  uint32_t avg_delay_us;
+  uint32_t base_delay_us;
+  uint32_t sparse_flows;
+  uint32_t bulk_flows;
+  uint32_t unresponsive_flows;
+};
+
 #define NETLINK_VF_DEFAULT_BUF_SIZE_KB 16
 
 struct ir_link_stats_storage_s {
@@ -129,6 +145,7 @@ typedef struct ir_ignorelist_s {
 struct qos_stats {
   struct gnet_stats_basic *bs;
   struct gnet_stats_queue *qs;
+  struct nlattr *xstats;  /* Extended stats (TCA_STATS_APP) for qdisc-specific data */
 };
 
 static int ir_ignorelist_invert = 1;
@@ -240,7 +257,7 @@ static int check_ignorelist(const char *dev, const char *type,
   for (ir_ignorelist_t *i = ir_ignorelist_head; i != NULL; i = i->next) {
 #if HAVE_REGEX_H
     if (i->rdevice != NULL) {
-      if (regexec(i->rdevice, dev, 0, NULL, 0))
+      if (regexec(i->rdevice, dev, 0, NULL, 0) != REG_NOERROR)
         continue;
     } else
 #endif
@@ -329,6 +346,103 @@ static void submit_two(const char *dev, const char *type,
 
   plugin_dispatch_values(&vl);
 } /* void submit_two */
+
+/* Submit CAKE tin statistics - aligned with HTB format */
+static int submit_cake_tin(const char *dev, const char *tc_inst, int tin_idx,
+                            const char *type, const char *suffix, derive_t value) {
+  value_list_t vl = VALUE_LIST_INIT;
+  value_t values[1];
+  char type_instance[DATA_MAX_NAME_LEN];
+  char plugin_instance[DATA_MAX_NAME_LEN];
+
+  values[0].derive = value;
+
+  vl.values = values;
+  vl.values_len = 1;
+  sstrncpy(vl.plugin, "netlink", sizeof(vl.plugin));
+
+  /* Include TIN index in plugin_instance for proper TDengine filtering */
+  int pi_status = ssnprintf(plugin_instance, sizeof(plugin_instance),
+                            "%s_tin%d", dev, tin_idx);
+  if (pi_status >= sizeof(plugin_instance)) {
+    ERROR("netlink plugin: CAKE plugin_instance name truncated");
+    return -1;
+  }
+  sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
+
+  /* DEBUG: Log what we're submitting */
+  INFO("netlink plugin: CAKE submit_cake_tin: dev=%s, tin_idx=%d, plugin_instance=%s, type=%s, suffix=%s",
+       dev, tin_idx, vl.plugin_instance, type, suffix ? suffix : "NULL");
+
+  sstrncpy(vl.type, type, sizeof(vl.type));
+
+  /* Format type_instance: "cake-4:0" or "peak-cake-4:0" */
+  int status;
+  if (suffix != NULL && suffix[0] != '\0') {
+    status = ssnprintf(type_instance, sizeof(type_instance),
+                       "%s-%s", suffix, tc_inst);
+  } else {
+    status = ssnprintf(type_instance, sizeof(type_instance),
+                       "%s", tc_inst);
+  }
+
+  if (status >= sizeof(type_instance)) {
+    ERROR("netlink plugin: CAKE tin instance name truncated");
+    return -1;
+  }
+
+  sstrncpy(vl.type_instance, type_instance, sizeof(vl.type_instance));
+  return plugin_dispatch_values(&vl);
+}
+
+/* Submit CAKE tin statistics as gauge - aligned with HTB format */
+static int submit_cake_tin_gauge(const char *dev, const char *tc_inst, int tin_idx,
+                                  const char *type, const char *suffix,
+                                  gauge_t value) {
+  value_list_t vl = VALUE_LIST_INIT;
+  value_t values[1];
+  char type_instance[DATA_MAX_NAME_LEN];
+  char plugin_instance[DATA_MAX_NAME_LEN];
+
+  values[0].gauge = value;
+
+  vl.values = values;
+  vl.values_len = 1;
+  sstrncpy(vl.plugin, "netlink", sizeof(vl.plugin));
+
+  /* Include TIN index in plugin_instance for proper TDengine filtering */
+  int pi_status = ssnprintf(plugin_instance, sizeof(plugin_instance),
+                            "%s_tin%d", dev, tin_idx);
+  if (pi_status >= sizeof(plugin_instance)) {
+    ERROR("netlink plugin: CAKE plugin_instance gauge name truncated");
+    return -1;
+  }
+  sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
+
+  /* DEBUG: Log what we're submitting */
+  INFO("netlink plugin: CAKE submit_cake_tin_gauge: dev=%s, tin_idx=%d, plugin_instance=%s, type=%s, suffix=%s",
+       dev, tin_idx, vl.plugin_instance, type, suffix ? suffix : "NULL");
+
+  sstrncpy(vl.type, type, sizeof(vl.type));
+
+  /* Format type_instance: "peak-cake-4:0" */
+  int status;
+  if (suffix != NULL && suffix[0] != '\0') {
+    status = ssnprintf(type_instance, sizeof(type_instance),
+                       "%s-%s", suffix, tc_inst);
+  } else {
+    status = ssnprintf(type_instance, sizeof(type_instance),
+                       "%s", tc_inst);
+  }
+
+  if (status >= sizeof(type_instance)) {
+    ERROR("netlink plugin: CAKE tin gauge instance name truncated");
+    return -1;
+  }
+
+  sstrncpy(vl.type_instance, type_instance, sizeof(vl.type_instance));
+  return plugin_dispatch_values(&vl);
+}
 
 static int update_iflist(struct ifinfomsg *msg, const char *dev) {
   /* Update the `iflist'. It's used to know which interfaces exist and query
@@ -832,6 +946,22 @@ static int qos_attr_cb(const struct nlattr *attr, void *data) {
     return MNL_CB_OK;
   }
 
+  if (mnl_attr_get_type(attr) == TCA_STATS_APP) {
+    /* Extended stats for qdisc-specific data (e.g., CAKE tin stats) */
+    DEBUG("netlink plugin: Found TCA_STATS_APP attribute");
+    if (mnl_attr_validate(attr, MNL_TYPE_NESTED) < 0) {
+      ERROR("netlink plugin: qos_attr_cb: TCA_STATS_APP mnl_attr_validate "
+            "failed.");
+      return MNL_CB_ERROR;
+    }
+    q_stats->xstats = (struct nlattr *)attr;
+    return MNL_CB_OK;
+  }
+
+  /* Debug: log all attributes we receive */
+  DEBUG("netlink plugin: qos_attr_cb received attribute type: %d",
+        mnl_attr_get_type(attr));
+
   return MNL_CB_OK;
 } /* qos_attr_cb */
 #endif
@@ -934,7 +1064,11 @@ static int qos_filter_cb(const struct nlmsghdr *nlh, void *args) {
       return MNL_CB_ERROR;
     }
 
+    DEBUG("netlink plugin: Parsing TCA_STATS2 for %s (kind=%s)", dev, kind);
     mnl_attr_parse_nested(attr, qos_attr_cb, &q_stats);
+
+    DEBUG("netlink plugin: After parsing: bs=%p, qs=%p, xstats=%p",
+          q_stats.bs, q_stats.qs, q_stats.xstats);
 
     if (q_stats.bs != NULL || q_stats.qs != NULL) {
       char type_instance[DATA_MAX_NAME_LEN];
@@ -955,6 +1089,340 @@ static int qos_filter_cb(const struct nlmsghdr *nlh, void *args) {
       }
       if (q_stats.qs != NULL) {
         submit_one(dev, "if_tx_dropped", type_instance, q_stats.qs->drops);
+        /* Submit overlimits for HTB/CBQ classes - important for bandwidth monitoring */
+        /* Always submit overlimits metric, even when zero, for consistent monitoring */
+        char overlimit_inst[DATA_MAX_NAME_LEN];
+        int status = ssnprintf(overlimit_inst, sizeof(overlimit_inst), "%s-overlimits", type_instance);
+        if (status >= sizeof(overlimit_inst)) {
+          WARNING("netlink plugin: Instance name too long for overlimits metric, "
+                  "truncated: %s-overlimits", type_instance);
+        }
+        submit_one(dev, "derive", overlimit_inst, q_stats.qs->overlimits);
+      }
+
+      /* Process CAKE extended stats (tin statistics) from TCA_STATS_APP */
+      if (q_stats.xstats != NULL && kind != NULL && strcmp(kind, "cake") == 0) {
+        struct nlattr *cake_attr;
+        struct nlattr *tin_stats_attr = NULL;
+        uint64_t capacity_estimate = 0;
+        uint32_t memory_used = 0, memory_limit = 0;
+
+        /* Parse CAKE global statistics from TCA_STATS_APP */
+        mnl_attr_for_each_nested(cake_attr, q_stats.xstats) {
+          int type = mnl_attr_get_type(cake_attr);
+
+          if (type == TCA_CAKE_STATS_MEMORY_USED &&
+              mnl_attr_validate(cake_attr, MNL_TYPE_U32) >= 0) {
+            memory_used = mnl_attr_get_u32(cake_attr);
+          } else if (type == TCA_CAKE_STATS_MEMORY_LIMIT &&
+                     mnl_attr_validate(cake_attr, MNL_TYPE_U32) >= 0) {
+            memory_limit = mnl_attr_get_u32(cake_attr);
+          } else if (type == TCA_CAKE_STATS_CAPACITY_ESTIMATE64 &&
+                     mnl_attr_validate(cake_attr, MNL_TYPE_U64) >= 0) {
+            capacity_estimate = mnl_attr_get_u64(cake_attr);
+          } else if (type == TCA_CAKE_STATS_TIN_STATS) {
+            tin_stats_attr = cake_attr;
+          }
+        }
+
+        /* Submit global CAKE statistics as gauge values */
+        char cake_inst[DATA_MAX_NAME_LEN];
+        value_list_t vl = VALUE_LIST_INIT;
+        value_t val;
+
+        /* Submit memory-used */
+        int status = ssnprintf(cake_inst, sizeof(cake_inst), "%s-memory-used", tc_inst);
+        if (status >= sizeof(cake_inst)) {
+          WARNING("netlink plugin: Instance name too long for CAKE memory-used metric, "
+                  "truncated: %s-memory-used", tc_inst);
+        }
+        val.gauge = (gauge_t)memory_used;
+        vl.values = &val;
+        vl.values_len = 1;
+        sstrncpy(vl.plugin, "netlink", sizeof(vl.plugin));
+        sstrncpy(vl.plugin_instance, dev, sizeof(vl.plugin_instance));
+        sstrncpy(vl.type, "memory", sizeof(vl.type));
+        sstrncpy(vl.type_instance, cake_inst, sizeof(vl.type_instance));
+        plugin_dispatch_values(&vl);
+
+        /* Submit memory-limit */
+        status = ssnprintf(cake_inst, sizeof(cake_inst), "%s-memory-limit", tc_inst);
+        if (status >= sizeof(cake_inst)) {
+          WARNING("netlink plugin: Instance name too long for CAKE memory-limit metric, "
+                  "truncated: %s-memory-limit", tc_inst);
+        }
+        val.gauge = (gauge_t)memory_limit;
+        sstrncpy(vl.type_instance, cake_inst, sizeof(vl.type_instance));
+        plugin_dispatch_values(&vl);
+
+        /* Submit capacity-estimate */
+        status = ssnprintf(cake_inst, sizeof(cake_inst), "%s-capacity", tc_inst);
+        if (status >= sizeof(cake_inst)) {
+          WARNING("netlink plugin: Instance name too long for CAKE capacity metric, "
+                  "truncated: %s-capacity", tc_inst);
+        }
+        val.gauge = (gauge_t)capacity_estimate;
+        sstrncpy(vl.type, "bitrate", sizeof(vl.type));
+        sstrncpy(vl.type_instance, cake_inst, sizeof(vl.type_instance));
+        plugin_dispatch_values(&vl);
+
+        if (tin_stats_attr != NULL) {
+          int tin_count = 0;
+          struct nlattr *tin_attr;
+
+          /* Iterate through tins - they are indexed starting from 1 */
+          mnl_attr_for_each_nested(tin_attr, tin_stats_attr) {
+            int tin_type = mnl_attr_get_type(tin_attr);
+
+            /* tin_type is 1-based, convert to 0-based for naming */
+            if (tin_type < 1 || tin_type > TC_CAKE_MAX_TINS)
+              continue;
+
+            int tin_idx = tin_type - 1;
+            struct nlattr *stat_attr;
+
+            /* Parse individual tin statistics */
+            mnl_attr_for_each_nested(stat_attr, tin_attr) {
+              int stat_type = mnl_attr_get_type(stat_attr);
+
+              switch (stat_type) {
+                case TCA_CAKE_TIN_STATS_SENT_BYTES64:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U64) >= 0) {
+                    uint64_t bytes = mnl_attr_get_u64(stat_attr);
+                    submit_cake_tin(dev, tc_inst, tin_idx, "ipt_bytes", NULL, (derive_t)bytes);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_SENT_PACKETS:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t packets = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin(dev, tc_inst, tin_idx, "ipt_packets", NULL, (derive_t)packets);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_DROPPED_PACKETS:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t dropped = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin(dev, tc_inst, tin_idx, "if_tx_dropped", NULL, (derive_t)dropped);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_ECN_MARKED_PACKETS:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t ecn = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "gauge", "ecn-marked", (gauge_t)ecn);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_BACKLOG_BYTES:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t backlog_bytes = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "queue_length", "bytes", (gauge_t)backlog_bytes);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_BACKLOG_PACKETS:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t backlog_packets = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "queue_length", "packets", (gauge_t)backlog_packets);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_SPARSE_FLOWS:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t sparse = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "gauge", "sparse-flows", (gauge_t)sparse);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_BULK_FLOWS:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t bulk = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "gauge", "bulk-flows", (gauge_t)bulk);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_UNRESPONSIVE_FLOWS:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t unresponsive = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "gauge", "unresponsive-flows", (gauge_t)unresponsive);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_PEAK_DELAY_US:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t peak_delay = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "delay", "peak", (gauge_t)peak_delay);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_AVG_DELAY_US:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t avg_delay = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "delay", "avg", (gauge_t)avg_delay);
+                  }
+                  break;
+
+                case TCA_CAKE_TIN_STATS_BASE_DELAY_US:
+                  if (mnl_attr_validate(stat_attr, MNL_TYPE_U32) >= 0) {
+                    uint32_t base_delay = mnl_attr_get_u32(stat_attr);
+                    submit_cake_tin_gauge(dev, tc_inst, tin_idx, "delay", "base", (gauge_t)base_delay);
+                  }
+                  break;
+              }
+            }
+
+            tin_count++;
+          }
+        }
+      }
+
+      /* Process FQ extended stats from TCA_STATS_APP */
+      if (q_stats.xstats != NULL && kind != NULL && strcmp(kind, "fq") == 0) {
+        /* FQ xstats are a binary blob (struct tc_fq_qd_stats) directly in xstats payload */
+        const void *xstats_data = mnl_attr_get_payload(q_stats.xstats);
+        size_t xstats_len = mnl_attr_get_payload_len(q_stats.xstats);
+
+        if (xstats_len >= sizeof(struct tc_fq_qd_stats)) {
+          const struct tc_fq_qd_stats *fq_stats = (const struct tc_fq_qd_stats *)xstats_data;
+
+          DEBUG("netlink plugin: FQ xstats for %s: flows=%u, throttled_flows=%u, throttled=%llu",
+                dev, fq_stats->flows, fq_stats->throttled_flows,
+                (unsigned long long)fq_stats->throttled);
+
+          /* Submit FQ-specific stats as gauges and derives */
+          char fq_inst[DATA_MAX_NAME_LEN];
+
+          /* Gauges: Current state */
+          int status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-flows", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one_gauge(dev, "gauge", fq_inst, (gauge_t)fq_stats->flows);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-inactive-flows", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one_gauge(dev, "gauge", fq_inst, (gauge_t)fq_stats->inactive_flows);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-throttled-flows", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one_gauge(dev, "gauge", fq_inst, (gauge_t)fq_stats->throttled_flows);
+          }
+
+          /* Derives: Cumulative counters */
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-gc-flows", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->gc_flows);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-throttled", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->throttled);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-highprio", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->highprio_packets);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-tcp-retrans", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->tcp_retrans);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-flows-plimit", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->flows_plimit);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-pkts-too-long", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->pkts_too_long);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-ce-mark", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->ce_mark);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-horizon-drops", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->horizon_drops);
+          }
+
+          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-horizon-caps", tc_inst);
+          if (status < sizeof(fq_inst)) {
+            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->horizon_caps);
+          }
+        }
+      }
+
+      /* Process FQ_CODEL extended stats from TCA_STATS_APP */
+      if (q_stats.xstats != NULL && kind != NULL && strcmp(kind, "fq_codel") == 0) {
+        /* FQ_CODEL xstats can be either qdisc stats or class stats (union) */
+        const void *xstats_data = mnl_attr_get_payload(q_stats.xstats);
+        size_t xstats_len = mnl_attr_get_payload_len(q_stats.xstats);
+
+        if (xstats_len >= sizeof(struct tc_fq_codel_xstats)) {
+          const struct tc_fq_codel_xstats *fqc_xstats = (const struct tc_fq_codel_xstats *)xstats_data;
+
+          /* Check if it's qdisc stats (type == TCA_FQ_CODEL_XSTATS_QDISC) */
+          if (fqc_xstats->type == TCA_FQ_CODEL_XSTATS_QDISC) {
+            const struct tc_fq_codel_qd_stats *qd_stats = &fqc_xstats->qdisc_stats;
+
+            DEBUG("netlink plugin: FQ_CODEL xstats for %s: new_flows=%u, ecn_mark=%u",
+                  dev, qd_stats->new_flow_count, qd_stats->ecn_mark);
+
+            char fqc_inst[DATA_MAX_NAME_LEN];
+
+            /* Gauges: Current state */
+            int status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-new-flows-len", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one_gauge(dev, "gauge", fqc_inst, (gauge_t)qd_stats->new_flows_len);
+            }
+
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-old-flows-len", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one_gauge(dev, "gauge", fqc_inst, (gauge_t)qd_stats->old_flows_len);
+            }
+
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-maxpacket", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one_gauge(dev, "gauge", fqc_inst, (gauge_t)qd_stats->maxpacket);
+            }
+
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-memory-usage", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one_gauge(dev, "memory", fqc_inst, (gauge_t)qd_stats->memory_usage);
+            }
+
+            /* Derives: Cumulative counters */
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-new-flow-count", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->new_flow_count);
+            }
+
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-drop-overlimit", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->drop_overlimit);
+            }
+
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-drop-overmemory", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->drop_overmemory);
+            }
+
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-ecn-mark", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->ecn_mark);
+            }
+
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-ce-mark", tc_inst);
+            if (status < sizeof(fqc_inst)) {
+              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->ce_mark);
+            }
+          }
+        }
       }
     }
 

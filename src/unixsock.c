@@ -55,7 +55,7 @@ static const char *config_keys[] = {"SocketFile", "SocketGroup", "SocketPerms",
                                     "DeleteSocket"};
 static int config_keys_num = STATIC_ARRAY_SIZE(config_keys);
 
-static int loop;
+static volatile int loop = 0;
 
 /* socket configuration */
 static int sock_fd = -1;
@@ -249,6 +249,8 @@ static void *us_handle_client(void *arg) {
       cmd_handle_putval(fhout, buffer);
     } else if (strcasecmp(fields[0], "listval") == 0) {
       cmd_handle_listval(fhout, buffer);
+    } else if (strcasecmp(fields[0], "getallval") == 0) {
+      cmd_handle_getallval(fhout, buffer);
     } else if (strcasecmp(fields[0], "putnotif") == 0) {
       handle_putnotif(fhout, buffer);
     } else if (strcasecmp(fields[0], "flush") == 0) {
@@ -283,8 +285,14 @@ static void *us_server_thread(void __attribute__((unused)) * arg) {
     status = accept(sock_fd, NULL, NULL);
     if (status < 0) {
 
-      if (errno == EINTR)
+      if (errno == EINTR) {
+        /* Si shutdown en cours (loop=0), sock_fd déjà fermé par us_shutdown() */
+        if (loop == 0) {
+          INFO("unixsock plugin: accept() interrupted by shutdown");
+          pthread_exit((void *)0);
+        }
         continue;
+      }
 
       ERROR("unixsock plugin: accept failed: %s", STRERRNO);
       close(sock_fd);
@@ -380,12 +388,18 @@ static int us_init(void) {
 static int us_shutdown(void) {
   void *ret;
 
+  INFO("unixsock plugin: Shutting down...");
+
   loop = 0;
 
   if (listen_thread != (pthread_t)0) {
+    INFO("unixsock plugin: Sending SIGTERM to listen thread...");
     pthread_kill(listen_thread, SIGTERM);
+
+    INFO("unixsock plugin: Waiting for listen thread to terminate...");
     pthread_join(listen_thread, &ret);
     listen_thread = (pthread_t)0;
+    INFO("unixsock plugin: Listen thread terminated");
   }
 
   plugin_unregister_init("unixsock");
