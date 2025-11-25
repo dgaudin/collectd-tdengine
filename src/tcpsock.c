@@ -85,9 +85,13 @@ static SSL_CTX *ssl_ctx = NULL;
 static int tls_init_ctx(void) {
     const SSL_METHOD *method;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    /* OpenSSL < 1.1.0 requires explicit initialization */
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
+#endif
+    /* OpenSSL 1.1.0+: automatic initialization */
 
     /* Use TLS 1.2 or higher */
     method = TLS_server_method();
@@ -175,7 +179,9 @@ static void tls_cleanup(void) {
         SSL_CTX_free(ssl_ctx);
         ssl_ctx = NULL;
     }
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     EVP_cleanup();
+#endif
 }
 #endif /* HAVE_OPENSSL */
 
@@ -248,30 +254,48 @@ typedef struct {
     SSL *ssl;
 #endif
     bool is_tls;
+    /* Buffer for TLS read optimization */
+    char read_buf[4096];
+    size_t read_pos;
+    size_t read_len;
 } client_context_t;
 
 static int client_read_line(client_context_t *ctx, FILE *fhin, char *buffer, size_t buffer_size) {
 #ifdef HAVE_OPENSSL
     if (ctx->is_tls && ctx->ssl != NULL) {
-        /* TLS read */
-        int bytes_read = 0;
-        while (bytes_read < (int)buffer_size - 1) {
-            int ret = SSL_read(ctx->ssl, buffer + bytes_read, 1);
-            if (ret <= 0) {
-                int ssl_err = SSL_get_error(ctx->ssl, ret);
-                if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-                    continue;
+        /* TLS buffered read - much faster than byte-by-byte */
+        size_t line_len = 0;
+
+        while (line_len < buffer_size - 1) {
+            /* Fill internal buffer if empty */
+            if (ctx->read_pos >= ctx->read_len) {
+                int ret = SSL_read(ctx->ssl, ctx->read_buf, sizeof(ctx->read_buf));
+                if (ret <= 0) {
+                    int ssl_err = SSL_get_error(ctx->ssl, ret);
+                    if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+                        continue;
+                    }
+                    if (line_len > 0) {
+                        buffer[line_len] = '\0';
+                        return line_len;
+                    }
+                    return -1;
                 }
-                return -1;
+                ctx->read_pos = 0;
+                ctx->read_len = (size_t)ret;
             }
-            if (buffer[bytes_read] == '\n') {
-                buffer[bytes_read] = '\0';
-                return bytes_read;
+
+            /* Extract characters until newline */
+            char c = ctx->read_buf[ctx->read_pos++];
+            if (c == '\n') {
+                buffer[line_len] = '\0';
+                return line_len;
             }
-            bytes_read++;
+            buffer[line_len++] = c;
         }
-        buffer[bytes_read] = '\0';
-        return bytes_read;
+
+        buffer[line_len] = '\0';
+        return line_len;
     } else
 #endif
     {
@@ -309,6 +333,9 @@ static void *us_handle_client(void *arg) {
     client_context_t *ctx = (client_context_t *)arg;
     FILE *fhin = NULL;
     FILE *fhout = NULL;
+
+    DEBUG("tcpsock plugin: us_handle_client: Reading from fd #%i (TLS: %s)",
+          ctx->fd, ctx->is_tls ? "yes" : "no");
 
 #ifdef HAVE_OPENSSL
     /* Perform TLS handshake if TLS is enabled */
@@ -480,6 +507,8 @@ static void *us_handle_client(void *arg) {
         }
     }
 
+    DEBUG("tcpsock plugin: us_handle_client: Exiting..");
+
 #ifdef HAVE_OPENSSL
     if (ctx->ssl != NULL) {
         SSL_shutdown(ctx->ssl);
@@ -511,6 +540,7 @@ static void *us_server_thread(void __attribute__((unused)) * arg) {
         pthread_exit((void *)1);
 
     while (loop != 0) {
+        DEBUG("tcpsock plugin: Calling accept..");
         status = accept(sock_fd, NULL, NULL);
         if (status < 0) {
             char errbuf[1024];
@@ -541,10 +571,23 @@ static void *us_server_thread(void __attribute__((unused)) * arg) {
         }
 
         ctx->fd = status;
+
+        /* Add timeout to avoid blocking by malicious clients */
+        struct timeval tv;
+        tv.tv_sec = 30;
+        tv.tv_usec = 0;
+        setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(ctx->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
         ctx->is_tls = use_tls;
 #ifdef HAVE_OPENSSL
         ctx->ssl = NULL;
 #endif
+        /* Initialize read buffer for TLS optimization */
+        ctx->read_pos = 0;
+        ctx->read_len = 0;
+
+        DEBUG("Spawning child to handle connection on fd #%i", ctx->fd);
 
         pthread_attr_init(&th_attr);
         pthread_attr_setdetachstate(&th_attr, PTHREAD_CREATE_DETACHED);
@@ -589,6 +632,7 @@ static int us_config(const char *key, const char *val) {
             if (end != NULL)
                 *end = '\0';
 
+            sfree(listen_address);  /* Free old value if exists */
             listen_address = strdup(addr_copy);
 
             char *endptr = NULL;
