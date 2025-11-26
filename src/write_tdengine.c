@@ -1,9 +1,15 @@
 /**
  * write_tdengine.c - Plugin Collectd pour TDengine
- * Version: 2.4 - Support MAX_COLUMNS étendu (1-8 colonnes)
+ * Version: 2.13 - Fix auto-création tables avec clause USING
+ *
+ * V2.13 Fix:
+ * - FIX CRITIQUE: Ajout clause USING <stable> TAGS(?, ?) dans les prepared statements
+ *   Sans cette clause, taos_stmt_set_tbname_tags() ne peut pas auto-créer les tables
+ *   si la STABLE n'existe pas encore (création asynchrone)
+ * - Résout l'erreur -2147473917 en boucle (stale statement)
  *
  * V2.4 Improvements over V2.3:
- * - 📊 MAX_COLUMNS augmenté de 4 à 8 (support plus de métriques multi-colonnes)
+ * - MAX_COLUMNS augmenté de 4 à 8 (support plus de métriques multi-colonnes)
  *   Permet par exemple : interface avec rx/tx + errors/drops = 4 colonnes
  *
  * V2.3 Features (conservées):
@@ -936,19 +942,22 @@ static TAOS_STMT* get_or_create_stmt(config_t *conf, const char *stable_name, ui
         return NULL;
     }
 
-    /* Construire le SQL avec le bon nombre de placeholders (? pour chaque colonne + timestamp)
-     * Exemple: 1 col -> "INSERT INTO ? VALUES (?, ?)"
-     *          2 cols -> "INSERT INTO ? VALUES (?, ?, ?)"
-     *          3 cols -> "INSERT INTO ? VALUES (?, ?, ?, ?)"
-     *          4 cols -> "INSERT INTO ? VALUES (?, ?, ?, ?, ?)" */
-    char sql[128];
+    /* Construire le SQL avec clause USING pour auto-création de table
+     * La clause USING <stable> TAGS(?, ?) permet à taos_stmt_set_tbname_tags()
+     * de créer automatiquement la table si elle n'existe pas.
+     *
+     * Format: INSERT INTO ? USING <stable> TAGS(?, ?) VALUES (?, ?, ...)
+     * - 2 TAGS: hostname (NCHAR), plugin_instance (NCHAR)
+     * - 1 timestamp + N colonnes de valeurs */
+    char sql[256];
     char placeholders[64] = "?";  /* Timestamp */
 
     for (uint8_t i = 0; i < num_columns; i++) {
         strcat(placeholders, ", ?");
     }
 
-    snprintf(sql, sizeof(sql), "INSERT INTO ? VALUES (%s)", placeholders);
+    snprintf(sql, sizeof(sql), "INSERT INTO ? USING %s TAGS(?, ?) VALUES (%s)",
+             stable_name, placeholders);
 
     int ret = taos_stmt_prepare(stmt, sql, 0);
     if (ret != 0) {
