@@ -160,6 +160,7 @@ typedef struct {
     /* Synchronisation */
     pthread_mutex_t write_lock;
     pthread_mutex_t read_lock;
+    pthread_mutex_t buffer_cond_lock;  /* Mutex dédié pour buffer_cond */
     pthread_cond_t buffer_cond;
     pthread_mutex_t conn_lock;  /* Protège la connexion */
 
@@ -483,46 +484,45 @@ static int write_internal_metrics(config_t *conf) {
     };
 
     int num_metrics = sizeof(metrics) / sizeof(metrics[0]);
-    int64_t now = (int64_t)(cdtime() / 1000000);  /* Timestamp en millisecondes */
+    int64_t now = (int64_t)CDTIME_T_TO_MS(cdtime());  /* Timestamp en millisecondes */
 
-    /* Écrit chaque métrique avec un prepared statement */
+    /* Crée UN SEUL statement pour toutes les métriques (optimisation) */
+    pthread_mutex_lock(&conf->conn_lock);
+    if (!conf->conn) {
+        pthread_mutex_unlock(&conf->conn_lock);
+        return -1;
+    }
+    TAOS_STMT *stmt = taos_stmt_init(conf->conn);
+    pthread_mutex_unlock(&conf->conn_lock);
+
+    if (!stmt) {
+        WARNING(PLUGIN_NAME ": Failed to create statement for internal metrics");
+        return -1;
+    }
+
+    /* Prépare le SQL UNE SEULE FOIS */
+    const char *sql = "INSERT INTO ? USING write_tdengine_metrics TAGS(?, ?, ?) VALUES(?, ?)";
+    int ret = taos_stmt_prepare(stmt, sql, 0);
+    if (ret != 0) {
+        WARNING(PLUGIN_NAME ": taos_stmt_prepare failed: %s", taos_stmt_errstr(stmt));
+        taos_stmt_close(stmt);
+        return -1;
+    }
+
+    int32_t hostname_len = (int32_t)strlen(hostname);
+    int written = 0;
+
+    /* Boucle sur les métriques - réutilise le même statement */
     for (int i = 0; i < num_metrics; i++) {
-        int ret;  /* Variable de retour pour toute la boucle */
-
         /* Génère le nom de la child table */
         char child_table[256];
         snprintf(child_table, sizeof(child_table), "write_tdengine_metrics_%s_%s",
                  hostname, metrics[i].name);
 
-        /* Crée un nouveau statement pour chaque métrique (pas de cache) */
-        pthread_mutex_lock(&conf->conn_lock);
-        if (!conf->conn) {
-            pthread_mutex_unlock(&conf->conn_lock);
-            continue;
-        }
-        TAOS_STMT *stmt = taos_stmt_init(conf->conn);
-        pthread_mutex_unlock(&conf->conn_lock);
-
-        if (!stmt) {
-            WARNING(PLUGIN_NAME ": Failed to create statement for internal metric %s", metrics[i].name);
-            continue;
-        }
-
-        /* Prépare le SQL pour la STABLE write_tdengine_metrics (1 colonne: value) */
-        const char *sql = "INSERT INTO ? USING write_tdengine_metrics TAGS(?, ?, ?) VALUES(?, ?)";
-        ret = taos_stmt_prepare(stmt, sql, 0);
-        if (ret != 0) {
-            WARNING(PLUGIN_NAME ": taos_stmt_prepare failed for %s: %s",
-                    metrics[i].name, taos_stmt_errstr(stmt));
-            taos_stmt_close(stmt);
-            continue;
-        }
-
         /* Prépare les 3 TAGS : hostname, metric_name, metric_type */
         TAOS_MULTI_BIND tags[3];
         memset(tags, 0, sizeof(tags));
 
-        int32_t hostname_len = (int32_t)strlen(hostname);
         tags[0].buffer_type = TSDB_DATA_TYPE_NCHAR;
         tags[0].buffer = (void *)hostname;
         tags[0].buffer_length = hostname_len;
@@ -551,7 +551,6 @@ static int write_internal_metrics(config_t *conf) {
         if (ret != 0) {
             WARNING(PLUGIN_NAME ": taos_stmt_set_tbname_tags failed for %s: %s",
                     child_table, taos_stmt_errstr(stmt));
-            taos_stmt_close(stmt);
             continue;
         }
 
@@ -559,7 +558,6 @@ static int write_internal_metrics(config_t *conf) {
         TAOS_MULTI_BIND binds[2];
         memset(binds, 0, sizeof(binds));
 
-        /* Bind timestamp */
         binds[0].buffer_type = TSDB_DATA_TYPE_TIMESTAMP;
         binds[0].buffer = &now;
         binds[0].buffer_length = sizeof(int64_t);
@@ -567,7 +565,6 @@ static int write_internal_metrics(config_t *conf) {
         binds[0].is_null = NULL;
         binds[0].num = 1;
 
-        /* Bind value (DOUBLE) */
         binds[1].buffer_type = TSDB_DATA_TYPE_DOUBLE;
         binds[1].buffer = &metrics[i].value;
         binds[1].buffer_length = sizeof(double);
@@ -575,38 +572,38 @@ static int write_internal_metrics(config_t *conf) {
         binds[1].is_null = NULL;
         binds[1].num = 1;
 
-        /* Bind les paramètres */
         ret = taos_stmt_bind_param_batch(stmt, binds);
         if (ret != 0) {
             WARNING(PLUGIN_NAME ": taos_stmt_bind_param_batch failed for %s: %s",
                     metrics[i].name, taos_stmt_errstr(stmt));
-            taos_stmt_close(stmt);
             continue;
         }
 
-        /* Add batch */
         ret = taos_stmt_add_batch(stmt);
         if (ret != 0) {
             WARNING(PLUGIN_NAME ": taos_stmt_add_batch failed for %s: %s",
                     metrics[i].name, taos_stmt_errstr(stmt));
-            taos_stmt_close(stmt);
             continue;
         }
 
-        /* Execute */
-        ret = taos_stmt_execute(stmt);
-        if (ret != 0) {
-            WARNING(PLUGIN_NAME ": taos_stmt_execute failed for %s: %s",
-                    metrics[i].name, taos_stmt_errstr(stmt));
-            taos_stmt_close(stmt);
-            continue;
-        }
-
-        /* Ferme le statement */
-        taos_stmt_close(stmt);
+        written++;
     }
 
-    DEBUG(PLUGIN_NAME ": Successfully wrote %d internal metrics", num_metrics);
+    /* Execute UNE SEULE FOIS pour tout le batch */
+    if (written > 0) {
+        ret = taos_stmt_execute(stmt);
+        if (ret != 0) {
+            WARNING(PLUGIN_NAME ": taos_stmt_execute failed: %s", taos_stmt_errstr(stmt));
+        } else {
+            INFO(PLUGIN_NAME ": Internal metrics: wrote %d metrics (ts=%"PRId64")", written, now);
+        }
+    } else {
+        INFO(PLUGIN_NAME ": Internal metrics: no metrics to write");
+    }
+
+    /* Ferme le statement UNE SEULE FOIS */
+    taos_stmt_close(stmt);
+
     return 0;
 }
 
@@ -1033,7 +1030,11 @@ static int buffer_add_binary(config_t *conf, const data_point_t *point) {
     conf->write_idx = next_write;
 
     pthread_mutex_unlock(&conf->write_lock);
+
+    /* Signal avec le mutex dédié (POSIX-compliant) */
+    pthread_mutex_lock(&conf->buffer_cond_lock);
     pthread_cond_signal(&conf->buffer_cond);
+    pthread_mutex_unlock(&conf->buffer_cond_lock);
 
     return 0;
 }
@@ -1284,8 +1285,7 @@ static void* flush_thread_func(void *arg) {
     INFO(PLUGIN_NAME ": Flush thread started");
 
     while (conf->running) {
-        pthread_mutex_lock(&conf->read_lock);
-
+        /* Attente avec le mutex dédié (POSIX-compliant) */
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += BATCH_TIMEOUT_MS * 1000000;
@@ -1294,15 +1294,18 @@ static void* flush_thread_func(void *arg) {
             ts.tv_nsec -= 1000000000;
         }
 
-        pthread_cond_timedwait(&conf->buffer_cond, &conf->read_lock, &ts);
+        pthread_mutex_lock(&conf->buffer_cond_lock);
+        pthread_cond_timedwait(&conf->buffer_cond, &conf->buffer_cond_lock, &ts);
+        pthread_mutex_unlock(&conf->buffer_cond_lock);
 
+        /* Lecture du buffer avec son propre lock */
+        pthread_mutex_lock(&conf->read_lock);
         size_t count = 0;
         while (count < BATCH_SIZE && conf->read_idx != conf->write_idx) {
             memcpy(&batch[count], &conf->buffer_array[conf->read_idx], sizeof(data_point_t));
             conf->read_idx = (conf->read_idx + 1) % conf->buffer_capacity;
             count++;
         }
-
         pthread_mutex_unlock(&conf->read_lock);
 
         /* V2.2: Flush avec prepared statements + retry binaire */
@@ -1852,6 +1855,7 @@ static int config_callback(oconfig_item_t *ci) {
     /* Initialisation des locks et variables de condition */
     pthread_mutex_init(&g_config->write_lock, NULL);
     pthread_mutex_init(&g_config->read_lock, NULL);
+    pthread_mutex_init(&g_config->buffer_cond_lock, NULL);
     pthread_cond_init(&g_config->buffer_cond, NULL);
     pthread_rwlock_init(&g_config->table_cache.lock, NULL);
     pthread_rwlock_init(&g_config->stable_cache.lock, NULL);
@@ -2462,6 +2466,7 @@ static int shutdown_callback(void) {
     /* Nettoie les locks */
     pthread_mutex_destroy(&g_config->write_lock);
     pthread_mutex_destroy(&g_config->read_lock);
+    pthread_mutex_destroy(&g_config->buffer_cond_lock);
     pthread_cond_destroy(&g_config->buffer_cond);
     pthread_rwlock_destroy(&g_config->table_cache.lock);
     pthread_rwlock_destroy(&g_config->stable_cache.lock);

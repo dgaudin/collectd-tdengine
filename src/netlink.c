@@ -50,22 +50,6 @@
 #include <glob.h>
 #include <libmnl/libmnl.h>
 
-/* CAKE qdisc support - storage for tin statistics */
-struct cake_tin_data {
-  uint64_t sent_bytes;
-  uint32_t sent_packets;
-  uint32_t dropped_packets;
-  uint32_t ecn_marked_packets;
-  uint32_t backlog_bytes;
-  uint32_t backlog_packets;
-  uint32_t peak_delay_us;
-  uint32_t avg_delay_us;
-  uint32_t base_delay_us;
-  uint32_t sparse_flows;
-  uint32_t bulk_flows;
-  uint32_t unresponsive_flows;
-};
-
 #define NETLINK_VF_DEFAULT_BUF_SIZE_KB 16
 
 struct ir_link_stats_storage_s {
@@ -196,7 +180,6 @@ static int add_ignorelist(const char *dev, const char *type, const char *inst) {
       (void)regerror(status, re, errbuf, sizeof(errbuf));
       ERROR("netlink plugin: add_ignorelist: regcomp for %s failed: %s", dev,
             errbuf);
-      regfree(re);
       sfree(entry);
       sfree(copy);
       sfree(re);
@@ -219,7 +202,10 @@ static int add_ignorelist(const char *dev, const char *type, const char *inst) {
   if (entry->type == NULL) {
     sfree(entry->device);
 #if HAVE_REGEX_H
-    sfree(entry->rdevice);
+    if (entry->rdevice != NULL) {
+      regfree(entry->rdevice);
+      sfree(entry->rdevice);
+    }
 #endif
     sfree(entry);
     return -1;
@@ -231,7 +217,10 @@ static int add_ignorelist(const char *dev, const char *type, const char *inst) {
       sfree(entry->type);
       sfree(entry->device);
 #if HAVE_REGEX_H
-      sfree(entry->rdevice);
+      if (entry->rdevice != NULL) {
+        regfree(entry->rdevice);
+        sfree(entry->rdevice);
+      }
 #endif
       sfree(entry);
       return -1;
@@ -466,6 +455,10 @@ static int update_iflist(struct ifinfomsg *msg, const char *dev) {
       (strcmp(iflist[msg->ifi_index], dev) != 0)) {
     sfree(iflist[msg->ifi_index]);
     iflist[msg->ifi_index] = strdup(dev);
+    if (iflist[msg->ifi_index] == NULL) {
+      ERROR("netlink plugin: update_iflist: strdup failed.");
+      return -1;
+    }
   }
 
   return 0;
@@ -572,8 +565,13 @@ static void vf_info_submit(const char *dev, vf_stats_t *vf_stats) {
   uint8_t *mac = vf_stats->vf_mac->mac;
   uint32_t vf_num = vf_stats->vf_mac->vf;
   char instance[512];
-  ssnprintf(instance, sizeof(instance), "%s_vf%u_%02x:%02x:%02x:%02x:%02x:%02x",
-            dev, vf_num, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  int status =
+      ssnprintf(instance, sizeof(instance), "%s_vf%u_%02x:%02x:%02x:%02x:%02x:%02x",
+                dev, vf_num, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  if (status < 0 || (size_t)status >= sizeof(instance)) {
+    ERROR("netlink plugin: vf_info_submit: ssnprintf failed or truncated.");
+    return;
+  }
   DEBUG("netlink plugin: vf_info_submit: plugin_instance - %s", instance);
 
   submit_one_gauge(instance, "vf_link_info", "number", vf_num);
@@ -1040,8 +1038,12 @@ static int qos_filter_cb(const struct nlmsghdr *nlh, void *args) {
     if (strcmp(tc_type, "filter") == 0)
       numberic_id = tm->tcm_parent;
 
-    ssnprintf(tc_inst, sizeof(tc_inst), "%s-%x:%x", kind, numberic_id >> 16,
-              numberic_id & 0x0000FFFF);
+    int status = ssnprintf(tc_inst, sizeof(tc_inst), "%s-%x:%x", kind,
+                           numberic_id >> 16, numberic_id & 0x0000FFFF);
+    if (status < 0 || (size_t)status >= sizeof(tc_inst)) {
+      ERROR("netlink plugin: qos_filter_cb: ssnprintf failed or truncated.");
+      return MNL_CB_ERROR;
+    }
   }
 
   DEBUG("netlink plugin: qos_filter_cb: got %s for %s (%i).", tc_type, dev,
@@ -1296,131 +1298,247 @@ static int qos_filter_cb(const struct nlmsghdr *nlh, void *args) {
 
           /* Gauges: Current state */
           int status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-flows", tc_inst);
-          if (status < sizeof(fq_inst)) {
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-flows",
+                    tc_inst);
+          } else {
             submit_one_gauge(dev, "gauge", fq_inst, (gauge_t)fq_stats->flows);
           }
 
           status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-inactive-flows", tc_inst);
-          if (status < sizeof(fq_inst)) {
-            submit_one_gauge(dev, "gauge", fq_inst, (gauge_t)fq_stats->inactive_flows);
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-inactive-flows",
+                    tc_inst);
+          } else {
+            submit_one_gauge(dev, "gauge", fq_inst,
+                           (gauge_t)fq_stats->inactive_flows);
           }
 
-          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-throttled-flows", tc_inst);
-          if (status < sizeof(fq_inst)) {
-            submit_one_gauge(dev, "gauge", fq_inst, (gauge_t)fq_stats->throttled_flows);
+          status =
+              ssnprintf(fq_inst, sizeof(fq_inst), "%s-throttled-flows", tc_inst);
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-throttled-flows",
+                    tc_inst);
+          } else {
+            submit_one_gauge(dev, "gauge", fq_inst,
+                           (gauge_t)fq_stats->throttled_flows);
           }
 
           /* Derives: Cumulative counters */
           status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-gc-flows", tc_inst);
-          if (status < sizeof(fq_inst)) {
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-gc-flows",
+                    tc_inst);
+          } else {
             submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->gc_flows);
           }
 
           status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-throttled", tc_inst);
-          if (status < sizeof(fq_inst)) {
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-throttled",
+                    tc_inst);
+          } else {
             submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->throttled);
           }
 
           status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-highprio", tc_inst);
-          if (status < sizeof(fq_inst)) {
-            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->highprio_packets);
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-highprio",
+                    tc_inst);
+          } else {
+            submit_one(dev, "derive", fq_inst,
+                       (derive_t)fq_stats->highprio_packets);
           }
 
           status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-tcp-retrans", tc_inst);
-          if (status < sizeof(fq_inst)) {
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-tcp-retrans",
+                    tc_inst);
+          } else {
             submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->tcp_retrans);
           }
 
           status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-flows-plimit", tc_inst);
-          if (status < sizeof(fq_inst)) {
-            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->flows_plimit);
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-flows-plimit",
+                    tc_inst);
+          } else {
+            submit_one(dev, "derive", fq_inst,
+                       (derive_t)fq_stats->flows_plimit);
           }
 
-          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-pkts-too-long", tc_inst);
-          if (status < sizeof(fq_inst)) {
-            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->pkts_too_long);
+          status =
+              ssnprintf(fq_inst, sizeof(fq_inst), "%s-pkts-too-long", tc_inst);
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-pkts-too-long",
+                    tc_inst);
+          } else {
+            submit_one(dev, "derive", fq_inst,
+                       (derive_t)fq_stats->pkts_too_long);
           }
 
           status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-ce-mark", tc_inst);
-          if (status < sizeof(fq_inst)) {
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-ce-mark",
+                    tc_inst);
+          } else {
             submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->ce_mark);
           }
 
-          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-horizon-drops", tc_inst);
-          if (status < sizeof(fq_inst)) {
-            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->horizon_drops);
+          status =
+              ssnprintf(fq_inst, sizeof(fq_inst), "%s-horizon-drops", tc_inst);
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-horizon-drops",
+                    tc_inst);
+          } else {
+            submit_one(dev, "derive", fq_inst,
+                       (derive_t)fq_stats->horizon_drops);
           }
 
-          status = ssnprintf(fq_inst, sizeof(fq_inst), "%s-horizon-caps", tc_inst);
-          if (status < sizeof(fq_inst)) {
-            submit_one(dev, "derive", fq_inst, (derive_t)fq_stats->horizon_caps);
+          status =
+              ssnprintf(fq_inst, sizeof(fq_inst), "%s-horizon-caps", tc_inst);
+          if (status < 0 || (size_t)status >= sizeof(fq_inst)) {
+            WARNING("netlink plugin: Instance name too long for FQ metric, "
+                    "truncated: %s-horizon-caps",
+                    tc_inst);
+          } else {
+            submit_one(dev, "derive", fq_inst,
+                       (derive_t)fq_stats->horizon_caps);
           }
         }
       }
 
       /* Process FQ_CODEL extended stats from TCA_STATS_APP */
-      if (q_stats.xstats != NULL && kind != NULL && strcmp(kind, "fq_codel") == 0) {
+      if (q_stats.xstats != NULL && kind != NULL &&
+          strcmp(kind, "fq_codel") == 0) {
         /* FQ_CODEL xstats can be either qdisc stats or class stats (union) */
         const void *xstats_data = mnl_attr_get_payload(q_stats.xstats);
         size_t xstats_len = mnl_attr_get_payload_len(q_stats.xstats);
 
         if (xstats_len >= sizeof(struct tc_fq_codel_xstats)) {
-          const struct tc_fq_codel_xstats *fqc_xstats = (const struct tc_fq_codel_xstats *)xstats_data;
+          const struct tc_fq_codel_xstats *fqc_xstats =
+              (const struct tc_fq_codel_xstats *)xstats_data;
 
           /* Check if it's qdisc stats (type == TCA_FQ_CODEL_XSTATS_QDISC) */
           if (fqc_xstats->type == TCA_FQ_CODEL_XSTATS_QDISC) {
-            const struct tc_fq_codel_qd_stats *qd_stats = &fqc_xstats->qdisc_stats;
+            const struct tc_fq_codel_qd_stats *qd_stats =
+                &fqc_xstats->qdisc_stats;
 
-            DEBUG("netlink plugin: FQ_CODEL xstats for %s: new_flows=%u, ecn_mark=%u",
+            DEBUG("netlink plugin: FQ_CODEL xstats for %s: new_flows=%u, "
+                  "ecn_mark=%u",
                   dev, qd_stats->new_flow_count, qd_stats->ecn_mark);
 
             char fqc_inst[DATA_MAX_NAME_LEN];
 
             /* Gauges: Current state */
-            int status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-new-flows-len", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one_gauge(dev, "gauge", fqc_inst, (gauge_t)qd_stats->new_flows_len);
+            int status = ssnprintf(fqc_inst, sizeof(fqc_inst),
+                                   "%s-new-flows-len", tc_inst);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-new-flows-len",
+                      tc_inst);
+            } else {
+              submit_one_gauge(dev, "gauge", fqc_inst,
+                             (gauge_t)qd_stats->new_flows_len);
             }
 
-            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-old-flows-len", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one_gauge(dev, "gauge", fqc_inst, (gauge_t)qd_stats->old_flows_len);
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-old-flows-len",
+                               tc_inst);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-old-flows-len",
+                      tc_inst);
+            } else {
+              submit_one_gauge(dev, "gauge", fqc_inst,
+                             (gauge_t)qd_stats->old_flows_len);
             }
 
-            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-maxpacket", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one_gauge(dev, "gauge", fqc_inst, (gauge_t)qd_stats->maxpacket);
+            status =
+                ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-maxpacket", tc_inst);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-maxpacket",
+                      tc_inst);
+            } else {
+              submit_one_gauge(dev, "gauge", fqc_inst,
+                             (gauge_t)qd_stats->maxpacket);
             }
 
-            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-memory-usage", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one_gauge(dev, "memory", fqc_inst, (gauge_t)qd_stats->memory_usage);
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-memory-usage",
+                               tc_inst);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-memory-usage",
+                      tc_inst);
+            } else {
+              submit_one_gauge(dev, "memory", fqc_inst,
+                             (gauge_t)qd_stats->memory_usage);
             }
 
             /* Derives: Cumulative counters */
-            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-new-flow-count", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->new_flow_count);
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst),
+                               "%s-new-flow-count", tc_inst);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-new-flow-count",
+                      tc_inst);
+            } else {
+              submit_one(dev, "derive", fqc_inst,
+                         (derive_t)qd_stats->new_flow_count);
             }
 
-            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-drop-overlimit", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->drop_overlimit);
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-drop-overlimit",
+                               tc_inst);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-drop-overlimit",
+                      tc_inst);
+            } else {
+              submit_one(dev, "derive", fqc_inst,
+                         (derive_t)qd_stats->drop_overlimit);
             }
 
-            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-drop-overmemory", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->drop_overmemory);
+            status = ssnprintf(fqc_inst, sizeof(fqc_inst),
+                               "%s-drop-overmemory", tc_inst);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-drop-overmemory",
+                      tc_inst);
+            } else {
+              submit_one(dev, "derive", fqc_inst,
+                         (derive_t)qd_stats->drop_overmemory);
             }
 
-            status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-ecn-mark", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->ecn_mark);
+            status =
+                ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-ecn-mark", tc_inst);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-ecn-mark",
+                      tc_inst);
+            } else {
+              submit_one(dev, "derive", fqc_inst,
+                         (derive_t)qd_stats->ecn_mark);
             }
 
             status = ssnprintf(fqc_inst, sizeof(fqc_inst), "%s-ce-mark", tc_inst);
-            if (status < sizeof(fqc_inst)) {
-              submit_one(dev, "derive", fqc_inst, (derive_t)qd_stats->ce_mark);
+            if (status < 0 || (size_t)status >= sizeof(fqc_inst)) {
+              WARNING("netlink plugin: Instance name too long for FQ_CODEL "
+                      "metric, truncated: %s-ce-mark",
+                      tc_inst);
+            } else {
+              submit_one(dev, "derive", fqc_inst,
+                         (derive_t)qd_stats->ce_mark);
             }
           }
         }
@@ -1474,9 +1592,12 @@ static int qos_filter_cb(const struct nlmsghdr *nlh, void *args) {
   return MNL_CB_OK;
 } /* int qos_filter_cb */
 
+/* Default buffer size for TC collection (256KB for systems with many qdiscs) */
+#define NETLINK_TC_DEFAULT_BUF_SIZE (256 * 1024)
+
 static size_t ir_get_buffer_size() {
   if (collect_vf_stats == false) {
-    return MNL_SOCKET_BUFFER_SIZE;
+    return NETLINK_TC_DEFAULT_BUF_SIZE;
   }
 
   glob_t g;
@@ -1621,6 +1742,23 @@ static int ir_init(void) {
 
   nl_socket_buffer_size = ir_get_buffer_size();
 
+  /* Set kernel socket receive buffer to handle large TC dumps */
+  int rcvbuf = (int)nl_socket_buffer_size;
+  int fd = mnl_socket_get_fd(nl);
+  if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf)) < 0) {
+    /* Try without FORCE if we're not root */
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+      WARNING("netlink plugin: ir_init: setsockopt(SO_RCVBUF) failed: %s",
+              strerror(errno));
+    }
+  }
+  /* Verify actual buffer size */
+  int actual_rcvbuf = 0;
+  socklen_t optlen = sizeof(actual_rcvbuf);
+  getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcvbuf, &optlen);
+  INFO("netlink plugin: ir_init: socket rcvbuf = %d (requested %d)",
+       actual_rcvbuf, rcvbuf);
+
   read_buffer = malloc(nl_socket_buffer_size);
   if (read_buffer == NULL) {
     ERROR("netlink plugin: ir_init: malloc failed for read buffer");
@@ -1655,7 +1793,7 @@ static int ir_read(void) {
 
 #ifdef HAVE_IFLA_VF_STATS
   if (collect_vf_stats &&
-      mnl_attr_put_u32_check(nlh, sizeof(buf), IFLA_EXT_MASK,
+      mnl_attr_put_u32_check(nlh, nl_socket_buffer_size, IFLA_EXT_MASK,
                              RTEXT_FILTER_VF) == 0) {
     ERROR("netlink plugin: FAILED to set RTEXT_FILTER_VF");
     return -1;
@@ -1667,12 +1805,12 @@ static int ir_read(void) {
     return -1;
   }
 
-  ret = mnl_socket_recvfrom(nl, buf, sizeof(buf));
+  ret = mnl_socket_recvfrom(nl, buf, nl_socket_buffer_size);
   while (ret > 0) {
     ret = mnl_cb_run(buf, ret, seq, portid, link_filter_cb, NULL);
     if (ret <= MNL_CB_STOP)
       break;
-    ret = mnl_socket_recvfrom(nl, buf, sizeof(buf));
+    ret = mnl_socket_recvfrom(nl, buf, nl_socket_buffer_size);
   }
   if (ret < 0) {
     ERROR("netlink plugin: ir_read: mnl_socket_recvfrom failed: %s", STRERRNO);
@@ -1712,12 +1850,12 @@ static int ir_read(void) {
         continue;
       }
 
-      ret = mnl_socket_recvfrom(nl, buf, sizeof(buf));
+      ret = mnl_socket_recvfrom(nl, buf, nl_socket_buffer_size);
       while (ret > 0) {
         ret = mnl_cb_run(buf, ret, seq, portid, qos_filter_cb, &ifindex);
         if (ret <= MNL_CB_STOP)
           break;
-        ret = mnl_socket_recvfrom(nl, buf, sizeof(buf));
+        ret = mnl_socket_recvfrom(nl, buf, nl_socket_buffer_size);
       }
       if (ret < 0) {
         ERROR("netlink plugin: ir_read: mnl_socket_recvfrom failed: %s",
@@ -1738,6 +1876,14 @@ static int ir_shutdown(void) {
     mnl_socket_close(nl);
     nl = NULL;
   }
+
+  /* Free interface list */
+  for (size_t i = 0; i < iflist_len; i++) {
+    sfree(iflist[i]);
+  }
+  sfree(iflist);
+  iflist = NULL;
+  iflist_len = 0;
 
   ir_ignorelist_t *next = NULL;
   for (ir_ignorelist_t *i = ir_ignorelist_head; i != NULL; i = next) {
