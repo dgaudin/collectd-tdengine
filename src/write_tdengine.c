@@ -1,40 +1,23 @@
 /**
- * write_tdengine.c - Plugin Collectd pour TDengine
- * Version: 2.13 - Fix auto-création tables avec clause USING
+ *  * collectd - src/write_tdengine.c
+ * Copyright (C) 2025 Didier Gaudin
  *
- * V2.13 Fix:
- * - FIX CRITIQUE: Ajout clause USING <stable> TAGS(?, ?) dans les prepared statements
- *   Sans cette clause, taos_stmt_set_tbname_tags() ne peut pas auto-créer les tables
- *   si la STABLE n'existe pas encore (création asynchrone)
- * - Résout l'erreur -2147473917 en boucle (stale statement)
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; only version 2 of the License is applicable.
  *
- * V2.4 Improvements over V2.3:
- * - MAX_COLUMNS augmenté de 4 à 8 (support plus de métriques multi-colonnes)
- *   Permet par exemple : interface avec rx/tx + errors/drops = 4 colonnes
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
  *
- * V2.3 Features (conservées):
- * - CREATE TABLE asynchrone (thread dédié, zéro blocking)
- * - Queue thread-safe + cache optimiste
- * - Élimine la latence de ~5ms par nouvelle table
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  *
- * V2.2 Features (conservées):
- * - Retry mechanism avec data_point_t binaires (plus de perte de données !)
- * - Exponential backoff pour les retries (configurable)
- * - Flush du retry buffer avant shutdown (récupération maximale)
- * - Statistiques détaillées (total_retried, total_retry_failed)
- * - FIX: Invalidation du stmt_cache lors de la reconnexion TDengine
- *
- * V2.1 Features (conservées):
- * - Support 1-8 colonnes - généralisation du binding
- * - Cache statement par (stable, num_cols)
- * - Performance: 4-5x throughput (50K → 200-250K metrics/s)
- *
- * V2.0 Features (conservées):
- * - Thread-safe circular buffer avec batching
- * - Prepared statements avec cache LRU
- * - SQL Injection prevention avec échappement
- * - Lock-free reads optimisées pour haute performance
- */
+ * Authors:
+ *   Didier Gaudin <dgaudin at proginov.com>
+ **/
 
 #include "collectd.h"
 #include "plugin.h"
@@ -70,15 +53,19 @@
 #define TAOS_ERR_STMT_RANGE_HIGH -2147470000
 
 /* Structure optimisée pour stocker les données brutes dans le buffer
- * V2.4: Support 1-8 colonnes avec TAGS (doublé de 4 à 8)
- * Taille: ~480 bytes (permet métriques multi-colonnes complexes)
+ * - stb_single : métriques à 1 valeur (cpu, df, conntrack, load...)
+ * - stb_pair   : métriques à 2 valeurs (interface rx/tx)
+ * - metric_type : tag pour différencier les types (ex: "cpu_percent", "interface_octets")
  */
 #define MAX_COLUMNS 8
+#define STB_SINGLE "stb_single"  /* S-Table pour métriques à 1 valeur */
+#define STB_PAIR   "stb_pair"    /* S-Table pour métriques à 2 valeurs */
 typedef struct {
     char table_name[128];       /* Nom de la table de destination */
-    char stable_name[64];       /* Nom de la super-table */
+    char stable_name[64];       /* Nom de la super-table (stb_single ou stb_pair) */
     char hostname[64];          /* Tag: hostname */
     char plugin_instance[128];  /* Tag: plugin_instance */
+    char metric_type[64];       /* Tag: type de métrique (ex: "cpu_percent") */
     uint64_t timestamp;         /* Timestamp en millisecondes (precision='ms') */
 
     int64_t values[MAX_COLUMNS]; /* Valeurs des colonnes (max 8) */
@@ -132,13 +119,11 @@ typedef struct retention_config {
     struct retention_config *next;
 } retention_config_t;
 
-/* Structure pour une règle de mapping configurable */
-typedef struct mapping_rule {
-    char *plugin;
-    char *type;
-    char *stable;
-    struct mapping_rule *next;
-} mapping_rule_t;
+/* V3.0: Les mappings sont supprimés - auto-détection basée sur ds->ds_num
+ * - 1 valeur  → stb_single
+ * - 2 valeurs → stb_pair
+ * - metric_type = "<plugin>_<type>" (ex: "cpu_percent", "interface_octets")
+ */
 
 /* Configuration et état global thread-safe */
 typedef struct {
@@ -194,9 +179,6 @@ typedef struct {
     /* Liste chaînée des configurations de rétention */
     retention_config_t *retentions;
 
-    /* Liste chaînée des règles de mapping */
-    mapping_rule_t *mappings;
-
     /* Configuration de la logique de réessai */
     bool enable_retry;
     int retry_attempts;
@@ -237,18 +219,7 @@ static int tdengine_connect(config_t *conf);
 static int tdengine_ensure_connected(config_t *conf);
 static int create_aggregation_streams_for_stable(config_t *conf, const char *stable_name);
 
-static const mapping_rule_t* find_mapping_rule(const char *plugin, const char *type) {
-    for (mapping_rule_t *rule = g_config->mappings; rule != NULL; rule = rule->next) {
-        if (strcmp(rule->plugin, plugin) != 0) {
-            continue;
-        }
-        // Check for wildcard or exact match on type
-        if (strcmp(rule->type, "*") == 0 || strcmp(rule->type, type) == 0) {
-            return rule;
-        }
-    }
-    return NULL;
-}
+/* V3.0: find_mapping_rule supprimée - auto-détection dans write_callback() */
 
 /**
  * Échappe les caractères SQL dangereux dans une chaîne
@@ -322,9 +293,6 @@ static void build_table_name(char *dest, size_t size,
 }
 
 /**
- * V2.1: Cache des tables individuelles pour éviter CREATE TABLE répétées
- * V2.6: OBSOLÈTE - Plus utilisé depuis taos_stmt_set_tbname_tags()
- * Conservé pour compatibilité de structure mais jamais appelé
  */
 __attribute__((unused))
 static bool table_cache_exists(config_t *conf, const char *table_name) {
@@ -379,7 +347,6 @@ static void stable_cache_add(config_t *conf, const char *stable_name) {
 }
 
 /**
- * V2.11: Écrit les métriques internes du plugin vers TDengine
  * Cette fonction collecte et envoie les métriques de santé du plugin
  * Return: 0 si OK, -1 si erreur
  */
@@ -614,7 +581,6 @@ static int write_internal_metrics(config_t *conf) {
 }
 
 /**
- * V2.3: Crée une super-table de manière SYNCHRONE
  * Cette fonction est utilisée par le thread asynchrone de création
  * Auto-détection du schéma basée sur le nom de la super-table
  * Return: 0 si OK, -1 si erreur
@@ -630,33 +596,29 @@ static int ensure_stable_exists_sync(config_t *conf, const char *stable_name) {
     if (stable_cache_exists(conf, stable_name))
         return 0;
 
-    /* Détermine le schéma selon le nom de la super-table
-     * - interface_* : 2 colonnes (rx, tx)
-     * - tc_* : 1 colonne (val)
-     * - autres : 1 colonne (val)
+    /* V3.0: Schéma simplifié avec 2 S-Tables maîtres + tag metric_type
+     * - stb_single : 1 valeur (cpu, df, conntrack, load...)
+     * - stb_pair   : 2 valeurs (interface rx/tx)
      */
     char create_sql[512];
     int ret;
 
-    if (strstr(stable_name, "interface_octets") != NULL ||
-        strstr(stable_name, "interface_packets") != NULL ||
-        strstr(stable_name, "interface_errors") != NULL ||
-        strstr(stable_name, "interface_drops") != NULL) {
-        /* Types interface avec rx/tx */
+    if (strcmp(stable_name, STB_PAIR) == 0) {
+        /* stb_pair : métriques à 2 valeurs (ex: interface rx/tx) */
         ret = snprintf(create_sql, sizeof(create_sql),
                        "CREATE STABLE IF NOT EXISTS %s ("
-                       "ts TIMESTAMP, rx BIGINT, tx BIGINT"
+                       "ts TIMESTAMP, v1 BIGINT, v2 BIGINT"
                        ") TAGS ("
-                       "hostname NCHAR(64), plugin_instance NCHAR(128)"
+                       "hostname NCHAR(64), plugin_instance NCHAR(128), metric_type NCHAR(64)"
                        ")",
                        stable_name);
     } else {
-        /* Types simples (TC, etc.) avec une seule valeur */
+        /* stb_single : métriques à 1 valeur (défaut) */
         ret = snprintf(create_sql, sizeof(create_sql),
                        "CREATE STABLE IF NOT EXISTS %s ("
                        "ts TIMESTAMP, val BIGINT"
                        ") TAGS ("
-                       "hostname NCHAR(64), plugin_instance NCHAR(128)"
+                       "hostname NCHAR(64), plugin_instance NCHAR(128), metric_type NCHAR(64)"
                        ")",
                        stable_name);
     }
@@ -715,7 +677,6 @@ static int ensure_stable_exists_sync(config_t *conf, const char *stable_name) {
 }
 
 /**
- * V2.3: Thread dédié pour créer les tables de manière asynchrone
  * Traite la queue create_table_queue et exécute les CREATE STABLE
  */
 static void *create_table_thread_func(void *arg) {
@@ -782,7 +743,6 @@ static void *create_table_thread_func(void *arg) {
 }
 
 /**
- * V2.3: Envoie une requête de création de table au thread asynchrone
  * Cache optimiste : marque immédiatement la table comme "en cours" pour éviter les doublons
  * Return: toujours 0 (non-bloquant)
  */
@@ -837,8 +797,6 @@ static int compare_table_name(const void *a, const void *b) {
 }
 
 /**
- * Invalide tous les prepared statements en cache (V2.2)
- *
  * Appelé lors d'une reconnexion à TDengine pour s'assurer que tous
  * les statements sont recréés avec la nouvelle connexion.
  *
@@ -942,12 +900,12 @@ static TAOS_STMT* get_or_create_stmt(config_t *conf, const char *stable_name, ui
         return NULL;
     }
 
-    /* Construire le SQL avec clause USING pour auto-création de table
-     * La clause USING <stable> TAGS(?, ?) permet à taos_stmt_set_tbname_tags()
+    /* 
+     * La clause USING <stable> TAGS(?, ?, ?) permet à taos_stmt_set_tbname_tags()
      * de créer automatiquement la table si elle n'existe pas.
      *
-     * Format: INSERT INTO ? USING <stable> TAGS(?, ?) VALUES (?, ?, ...)
-     * - 2 TAGS: hostname (NCHAR), plugin_instance (NCHAR)
+     * Format: INSERT INTO ? USING <stable> TAGS(?, ?, ?) VALUES (?, ?, ...)
+     * - 3 TAGS: hostname (NCHAR), plugin_instance (NCHAR), metric_type (NCHAR)
      * - 1 timestamp + N colonnes de valeurs */
     char sql[256];
     char placeholders[64] = "?";  /* Timestamp */
@@ -956,7 +914,7 @@ static TAOS_STMT* get_or_create_stmt(config_t *conf, const char *stable_name, ui
         strcat(placeholders, ", ?");
     }
 
-    snprintf(sql, sizeof(sql), "INSERT INTO ? USING %s TAGS(?, ?) VALUES (%s)",
+    snprintf(sql, sizeof(sql), "INSERT INTO ? USING %s TAGS(?, ?, ?) VALUES (%s)",
              stable_name, placeholders);
 
     int ret = taos_stmt_prepare(stmt, sql, 0);
@@ -1015,7 +973,7 @@ static TAOS_STMT* get_or_create_stmt(config_t *conf, const char *stable_name, ui
 }
 
 /**
- * Ajoute un data_point binaire au buffer circulaire (V2.0)
+ * Ajoute un data_point binaire au buffer circulaire 
  * Thread-safe avec mutex pour le writer
  * Performance: ~microseconde pour copie de 160 bytes (vs 768 en V1)
  */
@@ -1051,17 +1009,6 @@ static int buffer_add_binary(config_t *conf, const data_point_t *point) {
 /**
  * Envoie un batch de données à TDengine
  * Utilisation mémoire optimisée avec un seul malloc pour le batch entier
- */
-/**
- * Flush optimisé V3.0 avec auto-création des tables via TAGS
- *
- * Améliorations V3.0 vs V2.0:
- * - Auto-création tables avec taos_stmt_set_tbname_tags() (élimine CREATE TABLE synchrone)
- * - Support 1-4 colonnes (plus seulement 1-2)
- * - Réutilisation statement par (stable, num_cols) au lieu de (table, is_dual)
- * - Réduction mémoire 42% (448 bytes vs 768 de V1.0)
- *
- * Performance attendue: 4-5x throughput (50K → 200-250K metrics/s)
  */
 static int flush_batch_stmt(config_t *conf, data_point_t *batch, size_t count,
                            TAOS_MULTI_BIND *binds_pool,
@@ -1112,12 +1059,12 @@ static int flush_batch_stmt(config_t *conf, data_point_t *batch, size_t count,
             continue;
         }
 
-        /* V2.6: Auto-création de table avec TAGS (TDengine 3.x native support)
+        /* Auto-création de table avec TAGS (TDengine 3.x native support)
          * Utilise taos_stmt_set_tbname_tags() pour créer automatiquement la table
          * si elle n'existe pas, éliminant le CREATE TABLE synchrone */
 
-        /* Prépare les TAGS pour l'auto-création */
-        TAOS_MULTI_BIND tags[2];
+        /* Prépare les 3 TAGS pour l'auto-création */
+        TAOS_MULTI_BIND tags[3];
         memset(tags, 0, sizeof(tags));
 
         /* Tag 1: hostname (NCHAR) */
@@ -1137,6 +1084,15 @@ static int flush_batch_stmt(config_t *conf, data_point_t *batch, size_t count,
         tags[1].length = &plugin_instance_len;
         tags[1].is_null = NULL;
         tags[1].num = 1;
+
+        /* Tag 3: metric_type (NCHAR) - V3.0 */
+        int32_t metric_type_len = (int32_t)strlen(batch[i].metric_type);
+        tags[2].buffer_type = TSDB_DATA_TYPE_NCHAR;
+        tags[2].buffer = (void *)batch[i].metric_type;
+        tags[2].buffer_length = metric_type_len;
+        tags[2].length = &metric_type_len;
+        tags[2].is_null = NULL;
+        tags[2].num = 1;
 
         /* Set table name avec auto-création via TAGS */
         int ret = taos_stmt_set_tbname_tags(stmt, current_table, tags);
@@ -1362,7 +1318,8 @@ static void* flush_thread_func(void *arg) {
                 }
                 __sync_fetch_and_add(&conf->total_errors, 1);
 
-                /* V2.10: Si le batch principal échoue, skip retry processing
+                /* 
+		 * Si le batch principal échoue, skip retry processing
                  * Raison: Si la connexion est down, tous les retry vont aussi échouer
                  * Mieux vaut attendre le prochain BATCH_TIMEOUT_MS pour laisser le temps
                  * à la connexion de se rétablir */
@@ -1374,12 +1331,10 @@ static void* flush_thread_func(void *arg) {
                 __sync_fetch_and_add(&conf->total_errors, 1);
                 __sync_fetch_and_add(&conf->total_dropped, count);
 
-                /* V2.10: Idem, skip pour laisser le temps à la connexion de se rétablir */
                 continue;
             }
         }
 
-        /* V2.2: Process retry buffer avec prepared statements binaires */
         if (conf->enable_retry) {
             pthread_mutex_lock(&conf->retry_buffer_lock);
             llentry_t *entry = llist_head(conf->retry_buffer);
@@ -1442,7 +1397,6 @@ static void* flush_thread_func(void *arg) {
             pthread_mutex_unlock(&conf->retry_buffer_lock);
         }
 
-        /* V2.11: Écriture périodique des métriques internes */
         if (conf->internal_metrics_enabled) {
             static cdtime_t last_metrics_write = 0;
             cdtime_t now = cdtime();
@@ -1454,7 +1408,6 @@ static void* flush_thread_func(void *arg) {
         }
     }
 
-    /* Flush final avant shutdown (V2.0: avec prepared statements) */
     INFO(PLUGIN_NAME ": Flushing remaining data before shutdown...");
     {
         pthread_mutex_lock(&conf->read_lock);
@@ -1472,7 +1425,6 @@ static void* flush_thread_func(void *arg) {
         }
     }
 
-    /* V2.2: Tente un dernier flush du retry buffer avant shutdown */
     INFO(PLUGIN_NAME ": Flushing retry buffer before shutdown...");
     pthread_mutex_lock(&conf->retry_buffer_lock);
     llentry_t *entry = llist_head(conf->retry_buffer);
@@ -1530,44 +1482,61 @@ static int write_callback(const data_set_t *ds, const value_list_t *vl,
     if (!is_connected)
         return -1;
 
-    const mapping_rule_t *rule = find_mapping_rule(vl->plugin, vl->type);
-    if (!rule)
-        return 0;
+    /* V3.0: Auto-détection de la S-Table maître basée sur ds->ds_num
+     * - 1 valeur  → stb_single
+     * - 2 valeurs → stb_pair
+     * - >2 valeurs → non supporté (pour l'instant)
+     */
+    const char *stable_name;
+    if (ds->ds_num == 1) {
+        stable_name = STB_SINGLE;
+    } else if (ds->ds_num == 2) {
+        stable_name = STB_PAIR;
+    } else {
+        /* Métriques avec >2 colonnes : on prend les 2 premières pour stb_pair */
+        DEBUG(PLUGIN_NAME ": Metric %s/%s has %zu values, using first 2 for stb_pair",
+              vl->plugin, vl->type, ds->ds_num);
+        stable_name = STB_PAIR;
+    }
+
+    /* 
+     * Génère metric_type = "<plugin>_<type>" (ex: "cpu_percent", "interface_octets")
+     * Limité à 63 caractères pour tenir dans le champ NCHAR(64) */
+    char metric_type[64];
+    snprintf(metric_type, sizeof(metric_type), "%.30s_%.30s", vl->plugin, vl->type);
 
     /* Construit le nom de la table avec sécurité SQL
-     * Inclut type_instance pour différencier les CAKE TINs (tin0, tin1, etc.) */
+     * Utilise metric_type au lieu de stable_name pour que chaque
+     * (interface, type) ait sa propre table enfant. Sinon tous les types
+     * d'une même interface partageraient le même TAG metric_type fixe.
+     * Format: <metric_type>_<plugin_instance>_<type_instance>
+     */
     char table_name[TABLE_NAME_MAX];
-    build_table_name(table_name, sizeof(table_name), rule->stable,
+    build_table_name(table_name, sizeof(table_name), metric_type,
                     vl->plugin_instance, vl->type_instance, vl->host);
 
     /* Convertit le timestamp collectd en millisecondes (TDengine timestamp avec precision='ms') */
     uint64_t ts = CDTIME_T_TO_MS(vl->time);
 
-    /* V3.0: Crée un data_point binaire optimisé avec support 1-4 colonnes
-     * et auto-création via TAGS (élimine CREATE TABLE synchrone) */
+    /* Crée un data_point binaire avec S-Table maître + metric_type */
     data_point_t point;
     memset(&point, 0, sizeof(point));
 
     /* Remplit les métadonnées */
     sstrncpy(point.table_name, table_name, sizeof(point.table_name));
-    sstrncpy(point.stable_name, rule->stable, sizeof(point.stable_name));
+    sstrncpy(point.stable_name, stable_name, sizeof(point.stable_name));
     sstrncpy(point.hostname, vl->host, sizeof(point.hostname));
     sstrncpy(point.plugin_instance,
              (vl->plugin_instance[0] ? vl->plugin_instance : ""),
              sizeof(point.plugin_instance));
+    sstrncpy(point.metric_type, metric_type, sizeof(point.metric_type));
     point.timestamp = ts;
 
-    /* V3.0: Support 1-4 colonnes (généralisation) */
-    if (ds->ds_num > MAX_COLUMNS) {
-        WARNING(PLUGIN_NAME ": Too many columns %zu for table %s (max %d)",
-                ds->ds_num, table_name, MAX_COLUMNS);
-        return -1;
-    }
+    /* Nombre de valeurs limité à 2 (stb_single ou stb_pair) */
+    point.num_values = (ds->ds_num > 2) ? 2 : ds->ds_num;
 
-    point.num_values = ds->ds_num;
-
-    /* Convertit toutes les valeurs en int64_t */
-    for (size_t i = 0; i < ds->ds_num; i++) {
+    /* Convertit les valeurs en int64_t */
+    for (size_t i = 0; i < point.num_values; i++) {
         switch (ds->ds[i].type) {
         case DS_TYPE_GAUGE:
             point.values[i] = (int64_t)(vl->values[i].gauge * 1000000);  /* Préserve précision */
@@ -1588,21 +1557,11 @@ static int write_callback(const data_set_t *ds, const value_list_t *vl,
         }
     }
 
-    DEBUG(PLUGIN_NAME ": Created V3.0 point for %s: stable=%s, cols=%d, ts=%lu",
-          table_name, rule->stable, point.num_values, ts);
+    DEBUG(PLUGIN_NAME ": V3.0 point: table=%s stable=%s metric_type=%s cols=%d ts=%lu",
+          table_name, stable_name, metric_type, point.num_values, ts);
 
-    /* V2.6: Envoie la création de STABLE au thread asynchrone (non-bloquant)
-     * La création de la table individuelle est gérée automatiquement par
-     * taos_stmt_set_tbname_tags() dans flush_batch_stmt() - ZERO latence ! */
-    ensure_stable_exists_async(g_config, rule->stable);
-
-    /* V2.6: Plus besoin de CREATE TABLE synchrone !
-     * taos_stmt_set_tbname_tags() crée automatiquement la table lors de l'insertion
-     * Avantages:
-     * - Zéro latence dans write_callback (non-bloquant)
-     * - Création atomique par TDengine (thread-safe)
-     * - Cache de tables devenu inutile (supprimé)
-     */
+    /* Envoie la création de STABLE au thread asynchrone (non-bloquant) */
+    ensure_stable_exists_async(g_config, stable_name);
 
     return buffer_add_binary(g_config, &point);
 }
@@ -1705,43 +1664,6 @@ static int parse_retention_block(oconfig_item_t *ci, config_t *conf) {
     return 0;
 }
 
-static int parse_mapping_block(oconfig_item_t *ci, config_t *conf) {
-    mapping_rule_t *rule = calloc(1, sizeof(mapping_rule_t));
-    if (!rule) {
-        ERROR(PLUGIN_NAME ": Failed to allocate mapping rule");
-        return -1;
-    }
-
-    for (int i = 0; i < ci->children_num; i++) {
-        oconfig_item_t *child = ci->children + i;
-        if (strcasecmp("Plugin", child->key) == 0) {
-            cf_util_get_string(child, &rule->plugin);
-        } else if (strcasecmp("Type", child->key) == 0) {
-            cf_util_get_string(child, &rule->type);
-        } else if (strcasecmp("Stable", child->key) == 0) {
-            cf_util_get_string(child, &rule->stable);
-        }
-    }
-
-    if (!rule->plugin || !rule->type || !rule->stable) {
-        ERROR(PLUGIN_NAME ": Mapping block is missing Plugin, Type, or Stable");
-        free(rule->plugin);
-        free(rule->type);
-        free(rule->stable);
-        free(rule);
-        return -1;
-    }
-
-    // Add to the head of the list
-    rule->next = conf->mappings;
-    conf->mappings = rule;
-
-    INFO(PLUGIN_NAME ": Added mapping: Plugin=%s, Type=%s -> Stable=%s",
-         rule->plugin, rule->type, rule->stable);
-
-    return 0;
-}
-
 /**
  * Callback de configuration collectd
  * Parse les paramètres du fichier de configuration
@@ -1762,7 +1684,6 @@ static int config_callback(oconfig_item_t *ci) {
     g_config->retry_attempts = 3;
     g_config->retry_delay_ms = 1000;
     g_config->max_retry_buffer_size_bytes = 16 * 1024 * 1024;
-    g_config->mappings = NULL;
     /* V2.11: Métriques internes désactivées par défaut */
     g_config->internal_metrics_enabled = false;
     g_config->internal_metrics_interval = 60;  /* 60 secondes par défaut */
@@ -1811,10 +1732,7 @@ static int config_callback(oconfig_item_t *ci) {
                 ERROR(PLUGIN_NAME ": Failed to parse Retention block");
                 /* Continue parsing other blocks */
             }
-        } else if (strcasecmp("Mapping", child->key) == 0) {
-            if (parse_mapping_block(child, g_config) != 0) {
-                ERROR(PLUGIN_NAME ": Failed to parse Mapping block");
-            }
+        /* V3.0: Mapping supprimé - auto-détection basée sur ds->ds_num */
         } else if (strcasecmp("EnableRetry", child->key) == 0) {
             cf_util_get_boolean(child, &g_config->enable_retry);
         } else if (strcasecmp("RetryAttempts", child->key) == 0) {
@@ -1944,44 +1862,41 @@ static int create_aggregation_streams_for_stable(config_t *conf, const char *sta
             if (*p == '.') *p = '_';
         }
 
-        /* Détecte si c'est une table à 2 colonnes (rx/tx) ou 1 colonne (val) */
-        bool is_dual_column = (strstr(stable_name, "interface_octets") != NULL ||
-                              strstr(stable_name, "interface_packets") != NULL ||
-                              strstr(stable_name, "interface_errors") != NULL ||
-                              strstr(stable_name, "interface_drops") != NULL);
+        /* Détecte le type de S-Table maître par comparaison directe */
+        bool is_pair = (strcmp(stable_name, STB_PAIR) == 0);
 
-        /* Construit le SQL du STREAM */
+        /* Construit le SQL du STREAM avec metric_type dans PARTITION BY */
         char create_stream_sql[2048];
         int n;
 
-        if (is_dual_column) {
-            /* Pour les tables rx/tx, préserve les sous-tables (tbname) */
+        if (is_pair) {
+            /* stb_pair : métriques à 2 valeurs (v1, v2) */
             n = snprintf(create_stream_sql, sizeof(create_stream_sql),
                         "CREATE STREAM IF NOT EXISTS %s "
                         "INTO %s.%s SUBTABLE(tbname) "
                         "AS SELECT "
                         "_wstart AS ts, "
-                        "AVG(rx) AS rx, "
-                        "AVG(tx) AS tx, "
-                        "hostname, plugin_instance "
+                        "AVG(v1) AS v1, "
+                        "AVG(v2) AS v2, "
+                        "hostname, plugin_instance, metric_type "
                         "FROM %s.%s "
-                        "PARTITION BY tbname, hostname, plugin_instance "
+                        "PARTITION BY tbname, hostname, plugin_instance, metric_type "
                         "INTERVAL(%ds)",
                         stream_name,
                         ret->database, stable_name,
                         source_db, stable_name,
                         ret->resolution_seconds);
         } else {
-            /* Pour les tables à 1 colonne, préserve les sous-tables (tbname) */
+            /* stb_single : métriques à 1 valeur (val) */
             n = snprintf(create_stream_sql, sizeof(create_stream_sql),
                         "CREATE STREAM IF NOT EXISTS %s "
                         "INTO %s.%s SUBTABLE(tbname) "
                         "AS SELECT "
                         "_wstart AS ts, "
                         "AVG(val) AS val, "
-                        "hostname, plugin_instance "
+                        "hostname, plugin_instance, metric_type "
                         "FROM %s.%s "
-                        "PARTITION BY tbname, hostname, plugin_instance "
+                        "PARTITION BY tbname, hostname, plugin_instance, metric_type "
                         "INTERVAL(%ds)",
                         stream_name,
                         ret->database, stable_name,
@@ -2311,7 +2226,7 @@ static int init_callback(void) {
         }
     }
 
-    /* V2.0: Initialise le cache de prepared statements */
+    /* Initialise le cache de prepared statements */
     memset(&g_config->stmt_cache, 0, sizeof(stmt_cache_t));
     if (pthread_rwlock_init(&g_config->stmt_cache.lock, NULL) != 0) {
         ERROR(PLUGIN_NAME ": Failed to initialize statement cache lock");
@@ -2414,7 +2329,7 @@ static int shutdown_callback(void) {
         INFO(PLUGIN_NAME ": Flush thread terminated gracefully");
     }
 
-    /* V2.8: Attend que le thread de création de tables se termine */
+    /* Attend que le thread de création de tables se termine */
     INFO(PLUGIN_NAME ": Waiting for create table thread to finish gracefully...");
 
     join_status = pthread_join(g_config->create_table_thread, NULL);
@@ -2500,16 +2415,7 @@ static int shutdown_callback(void) {
     }
     llist_destroy(g_config->retry_buffer);
 
-    /* Libère la liste chaînée des mappings */
-    mapping_rule_t *rule = g_config->mappings;
-    while (rule != NULL) {
-        mapping_rule_t *next = rule->next;
-        free(rule->plugin);
-        free(rule->type);
-        free(rule->stable);
-        free(rule);
-        rule = next;
-    }
+    /* Mappings supprimés - plus rien à libérer */
 
     /* Libère la liste chaînée des retentions */
     retention_config_t *ret = g_config->retentions;
