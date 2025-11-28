@@ -1,0 +1,215 @@
+#
+# Config file for collectd(1).
+# Please read collectd.conf(5) for a list of options.
+# http://collectd.org/
+#
+
+##############################################################################
+# Global                                                                     #
+#----------------------------------------------------------------------------#
+# Global settings for the daemon.                                            #
+##############################################################################
+
+Hostname    "localhost"
+#FQDNLookup   true
+BaseDir     "/var/lib/collectd"
+PIDFile     "/var/run/collectd.pid"
+PluginDir   "/usr/lib/collectd"
+TypesDB     "/usr/share/collectd/types.db"
+Interval     1
+Timeout      2
+Include     "/etc/collectd/collectd.d/*.conf"
+#ReadThreads  5
+
+##############################################################################
+# Logging                                                                    #
+#----------------------------------------------------------------------------#
+# Plugins which provide logging functions should be loaded first, so log     #
+# messages generated when loading or configuring other plugins can be        #
+# accessed.                                                                  #
+##############################################################################
+
+#LoadPlugin csv
+LoadPlugin rrdtool
+LoadPlugin tcpsock
+LoadPlugin unixsock
+
+#<Plugin csv>
+#	DataDir "/var/lib/collectd/csv"
+#	StoreRates false
+#</Plugin>
+<Plugin unixsock>
+    SocketFile "/var/tmp/collectd.sock"
+    SocketGroup "apache"
+    SocketPerms "0777"
+</Plugin>
+
+<Plugin tcpsock>
+    # TLS disponible si compilé avec --with-libssl
+    Listen "0.0.0.0" "25827"
+    TLS false  # Désactivé car tcpsock pas compilé avec OpenSSL
+    #TLSCertificateFile "/etc/collectd/tls/server.crt"
+    #TLSKeyFile "/etc/collectd/tls/server.key"
+</Plugin>
+
+<Plugin rrdtool>
+       DataDir "/var/lib/collectd/rrd"
+#       CacheTimeout 120
+       CacheFlush   60
+        RRATimespan 10800 #3heures ->step 1s
+        RRATimespan 21600 #6heures ->step 4s
+        RRATimespan 43200 #12h -> step 12s
+        RRATimespan 86400 #24h ->step 24s
+        RRATimespan 172800 # 48h ->48s
+        RRATimespan 345600 #4j ->96s
+        RRATimespan 691200 #8j -> 192s
+        RRATimespan 1382400 #16j ->364s (6min)
+        RRATimespan 2764800 #1mois -> 738 (12min)
+        RRATimespan 8294400 #3 mois -> 2214s (36 min)
+        RRATimespan 16588800 # 6 mois -> 4428(1 heurs)
+        RRATimespan 31622400 # 1 ans -> 8784 s (2h)
+        RRARows 3600
+</Plugin>
+
+LoadPlugin Conntrack
+LoadPlugin Memory
+LoadPlugin CPU
+LoadPlugin Df
+LoadPlugin Interface
+LoadPlugin match_regex
+LoadPlugin write_tdengine
+# =================================================================
+# Configuration write_tdengine SIMPLIFIÉE pour CAKE/Netlink
+# Même comportement que RRDtool : pas de TypeInstance = wildcard
+# =================================================================
+
+<Plugin write_tdengine>
+  Host "localhost"
+  Port 6030
+  User "root"
+  Password "taosdata"
+  Database "collectd_metrics"
+  BufferSize 100000
+
+  # Activation et configuration du mécanisme de réessai
+  EnableRetry true
+  RetryAttempts 5
+  RetryDelay 2000          # Délai initial de 2 secondes
+  MaxRetryBufferSize 32    # Tampon de 32 Mo
+
+  # V2.11: Métriques internes du plugin (self-monitoring)
+  InternalMetrics true
+  InternalMetricsInterval 60  # Écriture toutes les 60 secondes
+
+
+    # Niveaux de rétention
+    <Retention>
+        Duration "12h"
+        Resolution "1s"
+        Database "collectd_metrics"
+        IsRaw true
+    </Retention>
+    <Retention>
+        Duration "3d"
+        Resolution "10s"
+        Database "collectd_10s"
+    </Retention>
+    <Retention>
+        Duration "7d"
+        Resolution "30s"
+        Database "collectd_30s"
+    </Retention>
+    <Retention>
+        Duration "30d"
+        Resolution "5m"
+        Database "collectd_5m"
+    </Retention>
+    <Retention>
+        Duration "365d"
+        Resolution "30m"
+        Database "collectd_30m"
+    </Retention>
+    <Retention>
+        Duration "730d"
+        Resolution "1h"
+        Database "collectd_1h"
+    </Retention>
+</Plugin>
+
+
+<Plugin CPU>
+ReportByState true
+ReportByCpu false
+</Plugin>
+
+<Plugin Df>
+    # Collecter tous les points de montage
+    # Le filtrage sera fait par la Filter Chain (ne garder que root et var)
+    IgnoreSelected false
+</Plugin>
+
+<Plugin Interface>
+    # Collecter toutes les interfaces (sauf lo si désiré)
+    # Interface "eth0"
+    # Interface "wlan0"
+    IgnoreSelected false
+</Plugin>
+
+
+# ================================================================
+# Filter Chain - Filtrage avancé AVANT write_tdengine
+# ================================================================
+PostCacheChain "FilterBeforeTDengine"
+
+<Chain "FilterBeforeTDengine">
+    # Règle 1 : Ne garder que df-root et df-var
+    <Rule "df_filter_root_var">
+        <Match "regex">
+            Plugin "^df$"
+            PluginInstance "^(root|var)$"
+        </Match>
+        <Target "write">
+            Plugin "write_tdengine"
+            Plugin "rrdtool"
+        </Target>
+        Target "stop"
+    </Rule>
+
+    # Règle 2 : Bloquer tous les autres df
+    <Rule "df_block_others">
+        <Match "regex">
+            Plugin "^df$"
+        </Match>
+        Target "stop"
+    </Rule>
+
+    # Règle 3 (OPTIONNEL) : Filtrer certains TINs de CAKE si désiré
+    # Exemple : Ne garder que tin0 et tin1
+    # <Rule "netlink_filter_tins">
+    #     <Match "regex">
+    #         Plugin "^netlink$"
+    #         TypeInstance "^tin[01]$"
+    #     </Match>
+    #     <Target "write">
+    #         Plugin "write_tdengine"
+    #     </Target>
+    #     Target "stop"
+    # </Rule>
+
+    # Règle par défaut : Envoyer tout le reste vers write_tdengine
+    <Target "write">
+        Plugin "write_tdengine"
+	Plugin "rrdtool"
+    </Target>
+</Chain>
+
+
+LoadPlugin logfile
+
+<Plugin logfile>
+    LogLevel debug         # debug / info / notice / warning / err
+    File "/var/log/collectd.log"
+    Timestamp true
+    PrintSeverity true
+</Plugin>
+
