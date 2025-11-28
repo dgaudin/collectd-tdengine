@@ -360,10 +360,6 @@ static int submit_cake_tin(const char *dev, const char *tc_inst, int tin_idx,
   }
   sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
 
-  /* DEBUG: Log what we're submitting */
-  INFO("netlink plugin: CAKE submit_cake_tin: dev=%s, tin_idx=%d, plugin_instance=%s, type=%s, suffix=%s",
-       dev, tin_idx, vl.plugin_instance, type, suffix ? suffix : "NULL");
-
   sstrncpy(vl.type, type, sizeof(vl.type));
 
   /* Format type_instance: "cake-4:0" or "peak-cake-4:0" */
@@ -408,10 +404,6 @@ static int submit_cake_tin_gauge(const char *dev, const char *tc_inst, int tin_i
     return -1;
   }
   sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
-
-  /* DEBUG: Log what we're submitting */
-  INFO("netlink plugin: CAKE submit_cake_tin_gauge: dev=%s, tin_idx=%d, plugin_instance=%s, type=%s, suffix=%s",
-       dev, tin_idx, vl.plugin_instance, type, suffix ? suffix : "NULL");
 
   sstrncpy(vl.type, type, sizeof(vl.type));
 
