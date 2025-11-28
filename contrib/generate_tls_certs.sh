@@ -18,11 +18,11 @@ NC='\033[0m'
 # Configuration
 TLS_DIR="/etc/collectd/tls"
 COUNTRY="FR"
-STATE="IDF"
-CITY="Paris"
-ORG="MyCompany"
-CA_CN="Collectd CA"
-SERVER_CN="collectd.example.com"
+STATE="Pays de la Loire"
+CITY="La Chevroliere"
+ORG="Proginov"
+CA_CN="Collectd"
+SERVER_CN="progibox"
 CLIENT_CN="client1"
 
 # Validité des certificats
