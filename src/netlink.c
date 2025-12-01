@@ -360,6 +360,10 @@ static int submit_cake_tin(const char *dev, const char *tc_inst, int tin_idx,
   }
   sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
 
+  /* DEBUG: Log what we're submitting */
+  INFO("netlink plugin: CAKE submit_cake_tin: dev=%s, tin_idx=%d, plugin_instance=%s, type=%s, suffix=%s",
+       dev, tin_idx, vl.plugin_instance, type, suffix ? suffix : "NULL");
+
   sstrncpy(vl.type, type, sizeof(vl.type));
 
   /* Format type_instance: "cake-4:0" or "peak-cake-4:0" */
@@ -404,6 +408,10 @@ static int submit_cake_tin_gauge(const char *dev, const char *tc_inst, int tin_i
     return -1;
   }
   sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
+
+  /* DEBUG: Log what we're submitting */
+  INFO("netlink plugin: CAKE submit_cake_tin_gauge: dev=%s, tin_idx=%d, plugin_instance=%s, type=%s, suffix=%s",
+       dev, tin_idx, vl.plugin_instance, type, suffix ? suffix : "NULL");
 
   sstrncpy(vl.type, type, sizeof(vl.type));
 
@@ -1532,6 +1540,90 @@ static int qos_filter_cb(const struct nlmsghdr *nlh, void *args) {
               submit_one(dev, "derive", fqc_inst,
                          (derive_t)qd_stats->ce_mark);
             }
+          }
+        }
+      }
+
+      /* Process FQ_PIE extended stats from TCA_STATS_APP */
+      if (q_stats.xstats != NULL && kind != NULL &&
+          strcmp(kind, "fq_pie") == 0) {
+        const void *xstats_data = mnl_attr_get_payload(q_stats.xstats);
+        size_t xstats_len = mnl_attr_get_payload_len(q_stats.xstats);
+
+        if (xstats_len >= sizeof(struct tc_fq_pie_xstats)) {
+          const struct tc_fq_pie_xstats *fqp_stats =
+              (const struct tc_fq_pie_xstats *)xstats_data;
+
+          DEBUG("netlink plugin: FQ_PIE xstats for %s: packets_in=%u, "
+                "ecn_mark=%u, memory=%u",
+                dev, fqp_stats->packets_in, fqp_stats->ecn_mark,
+                fqp_stats->memory_usage);
+
+          char fqp_inst[DATA_MAX_NAME_LEN];
+
+          /* Gauges: Current state */
+          int status = ssnprintf(fqp_inst, sizeof(fqp_inst),
+                                 "%s-new-flows-len", tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one_gauge(dev, "gauge", fqp_inst,
+                           (gauge_t)fqp_stats->new_flows_len);
+          }
+
+          status = ssnprintf(fqp_inst, sizeof(fqp_inst), "%s-old-flows-len",
+                             tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one_gauge(dev, "gauge", fqp_inst,
+                           (gauge_t)fqp_stats->old_flows_len);
+          }
+
+          status = ssnprintf(fqp_inst, sizeof(fqp_inst), "%s-memory-usage",
+                             tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one_gauge(dev, "memory", fqp_inst,
+                           (gauge_t)fqp_stats->memory_usage);
+          }
+
+          /* Derives: Cumulative counters */
+          status = ssnprintf(fqp_inst, sizeof(fqp_inst), "%s-packets-in",
+                             tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one(dev, "derive", fqp_inst,
+                       (derive_t)fqp_stats->packets_in);
+          }
+
+          status = ssnprintf(fqp_inst, sizeof(fqp_inst), "%s-dropped",
+                             tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one(dev, "derive", fqp_inst,
+                       (derive_t)fqp_stats->dropped);
+          }
+
+          status = ssnprintf(fqp_inst, sizeof(fqp_inst), "%s-overlimit",
+                             tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one(dev, "derive", fqp_inst,
+                       (derive_t)fqp_stats->overlimit);
+          }
+
+          status = ssnprintf(fqp_inst, sizeof(fqp_inst), "%s-overmemory",
+                             tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one(dev, "derive", fqp_inst,
+                       (derive_t)fqp_stats->overmemory);
+          }
+
+          status = ssnprintf(fqp_inst, sizeof(fqp_inst), "%s-ecn-mark",
+                             tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one(dev, "derive", fqp_inst,
+                       (derive_t)fqp_stats->ecn_mark);
+          }
+
+          status = ssnprintf(fqp_inst, sizeof(fqp_inst), "%s-new-flow-count",
+                             tc_inst);
+          if (status >= 0 && (size_t)status < sizeof(fqp_inst)) {
+            submit_one(dev, "derive", fqp_inst,
+                       (derive_t)fqp_stats->new_flow_count);
           }
         }
       }
